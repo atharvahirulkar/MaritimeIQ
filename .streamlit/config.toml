@@ -1,0 +1,6 @@
+[client]
+# Single-file console — workspace modes are in-app radios, not Streamlit multipage.
+showSidebarNavigation = false
+
+[ui]
+hideTopBar = false

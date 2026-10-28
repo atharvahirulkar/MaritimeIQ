@@ -1,0 +1,41 @@
+# Deterministic governance policy for MaritimeIQ MCP gateway
+version: 1
+blocked_sql_keywords:
+  - DROP
+  - DELETE
+  - TRUNCATE
+  - ALTER
+  - MERGE INTO
+  - OVERWRITE DIRECTORY
+
+# Agents that may never read Bronze PII columns
+insight_forbidden_layers:
+  - bronze
+
+# Columns known/tagged as PII must be masked in tool responses
+pii_masking:
+  strategy: salted_hash
+  salt_env: MARITIMEIQ_PII_SALT
+  default_salt: maritimeiq-hackathon-salt
+  patterns:
+    email: '(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}'
+    phone: '(?:\+?\d[\d\s\-().]{7,}\d)'
+    passport: '(?i)\b[A-Z]{1,2}\d{6,9}\b'
+
+# Gold writes require a human approval id
+gold_requires_approval: true
+approval_id_prefix: APPR-
+
+# Adversarial prompt patterns to block
+adversarial_patterns:
+  - passport
+  - seaman.?s?\s*book
+  - raw\s+pii
+  - unmask
+  - show\s+all\s+(passports|emails|phones|tax\s*ids?)
+  - drop\s+table
+  - delete\s+from
+  - truncate\s+table
+
+audit:
+  path: lakehouse/context/audit_log.jsonl

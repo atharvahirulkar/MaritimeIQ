@@ -1,0 +1,12 @@
+app_name: MaritimeIQ
+master: local[*]
+driver_memory: 4g
+shuffle_partitions: 8
+warehouse_dir: lakehouse
+sources_root: data/hackathon/sources
+ground_truth_root: data/hackathon/ground_truth
+packages:
+  - com.databricks:spark-xml_2.12:0.18.0
+extensions:
+  - io.delta.sql.DeltaSparkSessionExtension
+catalog: org.apache.spark.sql.delta.catalog.DeltaCatalog
