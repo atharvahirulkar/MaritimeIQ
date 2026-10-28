@@ -1,6 +1,7 @@
 """Center-pane content for each walkthrough step."""
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import streamlit as st
@@ -120,8 +121,9 @@ def render_hitl(orch) -> None:
     if items:
         st.warning(f"{len(items)} gaps need your guidance before Silver activation continues.")
         if st.button(
-            "Accept Remaining High-Confidence Gaps",
-            help="Approve needs_review items with score ≥ 0.7",
+            "Accept All Judge-Plausible Gaps (score ≥ 0.7)",
+            help="Your bulk decision: approves every open gap the Judge did not grade 'wrong' with score ≥ 0.7. "
+            "Wrong-graded gaps still need individual review.",
         ):
             from maritimeiq.agents.context import ContextAgent
 
@@ -129,7 +131,7 @@ def render_hitl(orch) -> None:
             approved = 0
             for it in list(open_review_items()):
                 if float(it.get("score") or 0) >= 0.7 and it.get("grade") != "wrong":
-                    ctx.apply_human_decision(it["table"], it["column"], "approve")
+                    ctx.apply_human_decision(it["table"], it["column"], "approve", approver="human-bulk")
                     approved += 1
             st.session_state["hitl_resolved_count"] = int(
                 st.session_state.get("hitl_resolved_count") or 0
@@ -139,19 +141,84 @@ def render_hitl(orch) -> None:
     review_view.render_review(orch, embedded=True)
 
 
+def _er_decide(item: dict[str, Any], action: str, target: str | None) -> None:
+    from maritimeiq.agents.entity_resolution import record_er_decision
+    from maritimeiq.agents.orchestrator import invalidate_from
+
+    record_er_decision(item["id"], action, target, approver="ui-user")
+    invalidate_from("er")  # ER re-runs with the decision before Silver
+    st.session_state["hitl_resolved_count"] = int(st.session_state.get("hitl_resolved_count") or 0) + 1
+
+
 def render_connect(orch) -> None:
-    _title("Connect", "Entity resolution — masters that link disparate sources")
+    from maritimeiq.agents.entity_resolution import load_er_review, open_er_items
+
+    _title("Connect", "Entity resolution links disparate sources — you confirm what the agent is unsure about")
     silver = sorted(p.name for p in SILVER.iterdir() if p.is_dir()) if SILVER.exists() else []
     masters = [t for t in silver if t.startswith("master_") or "alias" in t or "record_map" in t]
-    c1, c2 = st.columns(2)
+    items = open_er_items()
+    reviewed = [i for i in load_er_review() if i.get("status") == "resolved"]
+    c1, c2, c3 = st.columns(3)
     with c1:
         _kpi("Master / Link Tables", len(masters) or "—")
     with c2:
-        _kpi("Phase", st.session_state.get("pipeline_state", {}).get("phase", "—"))
+        _kpi("Open Match Reviews", len(items))
+    with c3:
+        _kpi("Resolved Reviews", len(reviewed))
     if not masters:
-        st.info("Continue runs Entity Resolution to build vessel / port / customer masters.")
+        st.info("Continue from HITL runs Entity Resolution to build vessel / port / customer masters.")
         return
-    st.write(", ".join(masters))
+
+    if items:
+        st.warning(
+            f"{len(items)} uncertain matches need your guidance. Unconfirmed vessels/customers stay separate and "
+            "unresolved ports stay unmapped until you decide — decisions re-run entity resolution."
+        )
+        bulk = [i for i in items if i.get("candidates") and float(i.get("score") or 0) >= 85]
+        if bulk and st.button(f"Accept Top Suggestion for {len(bulk)} High-Score Matches (≥ 85)"):
+            for it in bulk:
+                top = it["candidates"][0]
+                if it["kind"] == "port":
+                    _er_decide(it, "map", top["locode"])
+                else:
+                    _er_decide(it, "link", top.get("master_vessel_id") or top.get("group"))
+            st.rerun()
+        kinds = sorted({i["kind"] for i in items})
+        kind = st.radio("Review type", kinds, horizontal=True, key="er_kind",
+                        format_func=lambda k: {"port": "Ports", "vessel": "AIS vessels", "vessel_name": "Vessel names",
+                                               "customer": "Customers"}.get(k, k))
+        for it in [i for i in items if i["kind"] == kind][:25]:
+            with st.container(border=True):
+                st.markdown(f"**{it['question']}**  ·  match score {it.get('score')}")
+                cands = it.get("candidates") or []
+                key = f"er_{it['id']}"
+                if it["kind"] == "port":
+                    opts = [f"{c['locode']} — {c['name']} ({c['score']})" for c in cands]
+                    cols = st.columns([3, 1, 1])
+                    choice = cols[0].selectbox("Map to", opts + ["Other LOCODE…"], key=f"{key}_sel", label_visibility="collapsed")
+                    other = cols[0].text_input("LOCODE", key=f"{key}_other", placeholder="e.g. CNSZX") if choice == "Other LOCODE…" else ""
+                    if cols[1].button("Map", key=f"{key}_map", type="primary"):
+                        code = other.strip().upper() if choice == "Other LOCODE…" else choice.split(" — ")[0]
+                        if code:
+                            _er_decide(it, "map", code)
+                            st.rerun()
+                    if cols[2].button("Not a port", key=f"{key}_np"):
+                        _er_decide(it, "not_port", None)
+                        st.rerun()
+                else:
+                    cand = cands[0] if cands else {}
+                    st.caption(f"Left: `{json.dumps(it.get('left'), default=str)}`  →  Candidate: `{json.dumps(cand, default=str)[:220]}`")
+                    cols = st.columns([1, 1, 3])
+                    if cols[0].button("Same entity — link", key=f"{key}_link", type="primary"):
+                        _er_decide(it, "link", cand.get("master_vessel_id") or cand.get("group"))
+                        st.rerun()
+                    if cols[1].button("Different — keep separate", key=f"{key}_sep"):
+                        _er_decide(it, "separate", None)
+                        st.rerun()
+    else:
+        st.success("No open match reviews. Continue builds Silver (re-running entity resolution if you changed anything).")
+
+    st.markdown("#### Masters")
     pick = st.selectbox("Preview Master", masters)
     sample = orch.gateway.lakehouse.read_sample(f"silver.{pick}", n=20, agent="ui")
     if sample.get("rows"):
@@ -182,8 +249,22 @@ def render_silver(orch) -> None:
             if sample.get("rows"):
                 st.dataframe(sample["rows"], use_container_width=True)
                 st.caption("Samples pass the governance guard (PII masked when tagged).")
+        qc_path = ROOT / "lakehouse" / "context" / "silver_qc.json"
+        if qc_path.exists():
+            qc = json.loads(qc_path.read_text(encoding="utf-8"))
+            with st.expander("Silver quality checks", expanded=not ready["ok"]):
+                st.dataframe(
+                    [
+                        {"Table": t, "OK": "✅" if v.get("ok") else "❌", "Rows": v.get("rows"),
+                         "Masked PII columns": ", ".join(v.get("masked_columns") or []) or "—",
+                         "Checks": "; ".join(f"{c['check']}={c['detail']}" for c in v.get("checks") or [])}
+                        for t, v in qc.items()
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
         if ready["ok"]:
-            st.success("Silver is ready. Continue to Act 2 — Gold relational mart.")
+            st.success("Silver is ready. Continue runs the Gold investigation agent.")
         else:
             st.warning("Resolve checklist items before Gold Build / Ask unlock fully.")
     with tab_cleanup:
@@ -194,69 +275,85 @@ def render_silver(orch) -> None:
 
 
 def render_gold(orch) -> None:
+    from maritimeiq.agents.orchestrator import load_progress
+
     _title(
         "Gold Build",
-        "AI investigates Silver + semantics and materializes a relational Gold mart for LLM Q&A",
+        "The investigation agent mined Silver for the metrics that matter — review, then approve to build Gold",
     )
     ready = silver_ready_checklist()
     if not ready["ok"]:
         st.error("Silver is not ready yet. Go back and complete Act 1.")
         return
-    catalog = load_gold_catalog()
     builder = GoldBuilderAgent(orch.spark, orch.gateway)
-    proposal = builder.propose_mart()
-    tab_mart, tab_cleanup, tab_dim = st.tabs(["Mart Build", "Cleanup Summary", "Dimensional Model"])
-    with tab_mart:
-        st.markdown("#### Proposed Relational Mart")
-        st.dataframe(
-            [
-                {
-                    "Table": p["table_name"],
-                    "Kind": p["kind"],
-                    "Grain": p["grain"],
-                    "Join Keys": ", ".join(p.get("join_keys") or []),
-                    "Answers": ", ".join(p.get("answers") or []),
-                }
-                for p in proposal.get("proposals") or []
-            ],
-            use_container_width=True,
-            hide_index=True,
+    plan = builder.load_plan()
+    if not plan:
+        st.info("Continue from Silver runs the investigation. You can also start it here.")
+        if st.button("Run Investigation", type="primary"):
+            with st.spinner("Investigating Silver…"):
+                builder.investigate()
+            st.rerun()
+        return
+    built = "gold" in load_progress()
+    tab_find, tab_kpi, tab_model, tab_cleanup = st.tabs(["Findings", "KPI Tables", "Dimensional Model", "Cleanup Summary"])
+    with tab_find:
+        st.caption("Each finding is backed by an executed query and graded by the LLM-as-Judge.")
+        for f in plan.get("findings") or []:
+            with st.container(border=True):
+                st.markdown(f"**{f['title']}** · Judge: `{f.get('judge_grade')}` ({float(f.get('judge_score') or 0):.2f}) · {f.get('source')}")
+                if f.get("headline"):
+                    st.markdown(f.get("headline"))
+                st.caption(f.get("why_it_matters") or "")
+                if f.get("judge_rationale"):
+                    st.caption(f"Judge: {f['judge_rationale']}")
+    with tab_kpi:
+        kpis = plan.get("kpis") or []
+        ready_ids = [k["id"] for k in kpis if k.get("status") == "ready"]
+        selected = st.multiselect(
+            "KPI tables to materialize", ready_ids, default=ready_ids, key="gold_kpi_select", disabled=built
         )
-        st.caption(f"Primary analyst surface: `{proposal.get('primary_view')}`")
-        if catalog.get("materialized"):
-            st.success("Materialized: " + ", ".join(catalog["materialized"]))
-        elif st.session_state.get("pipeline_state", {}).get("gold_mart", {}).get("materialized"):
-            st.success(
-                "Materialized: "
-                + ", ".join(st.session_state["pipeline_state"]["gold_mart"]["materialized"])
-            )
-        gold_tables = sorted(p.name for p in GOLD.iterdir() if p.is_dir()) if GOLD.exists() else []
-        if gold_tables:
-            st.markdown("#### Gold Tables On Disk")
-            st.write(", ".join(gold_tables))
-        st.info("Continue materializes the Gold mart (dims, facts, v_ops_overview).")
+        for k in kpis:
+            with st.expander(f"{k['title']} — {k.get('status')}", expanded=False):
+                st.caption(f"`{k['table_name']}` · grain: {k['grain']} · {k['why']}")
+                if k.get("error"):
+                    st.error(k["error"])
+                if k.get("preview"):
+                    st.dataframe(k["preview"], use_container_width=True)
+                if k.get("sql"):
+                    st.code(k["sql"], language="sql")
+    with tab_model:
+        st.markdown(gold_dim_model_mermaid(plan["dims"] + plan["facts"] + plan["kpis"]))
+        st.dataframe(
+            [{"Table": t["table_name"], "Kind": t.get("kind", "kpi"), "Grain": t["grain"], "Status": t.get("status")}
+             for t in plan["dims"] + plan["facts"] + plan["kpis"]],
+            use_container_width=True, hide_index=True,
+        )
     with tab_cleanup:
         summary = cleanup_summary()
         st.write(summary["narrative"])
         st.dataframe(summary["rows"], use_container_width=True, hide_index=True)
-    with tab_dim:
-        st.markdown("#### Star / Snowflake Sketch")
-        st.markdown(gold_dim_model_mermaid(proposal.get("proposals")))
-        st.markdown("#### Join Keys")
-        st.dataframe(
-            [
-                {
-                    "Table": p["table_name"],
-                    "Kind": p["kind"],
-                    "Grain": p["grain"],
-                    "Join Keys": ", ".join(p.get("join_keys") or []),
-                    "Source": p.get("source"),
-                }
-                for p in proposal.get("proposals") or []
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+
+    st.divider()
+    if built:
+        catalog = load_gold_catalog()
+        st.success(f"Gold built under approval `{catalog.get('approval_id')}`: " + ", ".join(catalog.get("materialized") or []))
+        if catalog.get("errors"):
+            st.error("Errors: " + "; ".join(catalog["errors"]))
+        return
+    st.warning("Gold writes need your approval. Nothing is written until you approve this plan.")
+    approver = st.text_input("Approver name", value=st.session_state.get("gold_approver", ""), key="gold_approver")
+    if st.button("Approve & Build Gold", type="primary", disabled=not approver.strip() or not st.session_state.get("gold_kpi_select")):
+        appr = orch.gateway.review.get_approval("gold.relational_mart", agent="human", approver=approver.strip())
+        with st.spinner("Materializing Gold…"):
+            state = orch.run(
+                through="gold",
+                state={"walkthrough": True, "gold_approval_id": appr["approval_id"],
+                       "gold_selected_kpis": st.session_state.get("gold_kpi_select")},
+            )
+        st.session_state.setdefault("pipeline_state", {})["phase"] = state.get("phase")
+        if state.get("phase") == "gold_done":
+            st.session_state["walk_step"] = "ask"
+        st.rerun()
 
 
 def render_ask(orch) -> None:

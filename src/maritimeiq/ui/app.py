@@ -13,7 +13,8 @@ from maritimeiq.utils.env import load_env
 
 load_env()
 
-from maritimeiq.agents.orchestrator import Orchestrator
+from maritimeiq.agents.entity_resolution import open_er_items
+from maritimeiq.agents.orchestrator import Orchestrator, load_progress
 from maritimeiq.ui.components.agent_feed import render_agent_feed
 from maritimeiq.ui.components.hitl_queue import open_review_items
 from maritimeiq.ui.components.pipeline_rail import render_pipeline_rail
@@ -83,41 +84,39 @@ def _store_pipeline_state(state: dict) -> None:
     _persist()
 
 
-def _handle_pipeline_run() -> None:
-    through = st.session_state.pop("run_pipeline_request", None)
-    if not through:
-        return
-    with st.spinner(f"Running through {through} (walkthrough HITL gates on)…"):
-        orch = get_orch()
-        state = orch.run(through=through, state={"walkthrough": True, "auto_approve_gold": False})
-        _store_pipeline_state(state)
+def _apply_run_result(state: dict, label: str) -> None:
+    _store_pipeline_state(state)
     phase = st.session_state["pipeline_state"].get("phase")
-    FEED.emit("orchestrator", f"UI pipeline complete through={through} phase={phase}")
+    FEED.emit("orchestrator", f"UI ran {label} → phase={phase}")
     if phase == "awaiting_hitl":
         st.session_state["walk_step"] = "hitl"
         st.toast("Paused for HITL — resolve semantic gaps, then Continue.")
+    elif phase == "awaiting_er_review":
+        st.session_state["walk_step"] = "connect"
+        st.toast("Paused — review uncertain entity matches, then Continue.")
+    elif phase == "awaiting_gold_approval":
+        st.session_state["walk_step"] = "gold"
+        st.toast("Gold plan ready — review findings and approve to build Gold.")
     else:
         st.toast(f"Phase: {str(phase).replace('_', ' ').title()}")
     _persist()
 
 
-def _run_stage(through: str) -> None:
+def _handle_pipeline_run() -> None:
+    through = st.session_state.pop("run_pipeline_request", None)
+    if not through:
+        return
+    with st.spinner(f"Running through {through} (HITL gates on)…"):
+        state = get_orch().run(through=through, state={"walkthrough": True})
+    _apply_run_result(state, f"batch through {through}")
+
+
+def _run_stage(through: str, extra: dict | None = None) -> dict:
+    """Resume the pipeline up to ``through``; completed stages are not re-run."""
     with st.spinner(f"Running {through}…"):
-        orch = get_orch()
-        state = orch.run(
-            through=through,
-            state={"walkthrough": True, "auto_approve_gold": through == "gold"},
-        )
-        _store_pipeline_state(state)
-    phase = st.session_state.get("pipeline_state", {}).get("phase")
-    if phase == "awaiting_hitl":
-        st.session_state["walk_step"] = "hitl"
-        st.toast("HITL required before the pipeline can continue.")
-    elif through == "gold":
-        st.session_state["walk_step"] = "ask"
-        st.toast("Gold mart built — Ask is ready.")
-    FEED.emit("orchestrator", f"Walk Continue ran through={through}", phase=phase)
-    _persist()
+        state = get_orch().run(through=through, state={"walkthrough": True, **(extra or {})})
+    _apply_run_result(state, through)
+    return state
 
 
 def _bootstrap_session() -> None:
@@ -155,10 +154,10 @@ if "hitl_resolved_count" not in st.session_state:
 _bootstrap_session()
 
 phase = st.session_state.get("pipeline_state", {}).get("phase")
-# If HITL was cleared after a refresh, promote awaiting_hitl → context_done
-if phase == "awaiting_hitl" and not open_review_items():
-    st.session_state["pipeline_state"]["phase"] = "context_done"
-    phase = "context_done"
+# If a HITL gate was cleared after a refresh, drop the stale pause
+if (phase == "awaiting_hitl" and not open_review_items()) or (phase == "awaiting_er_review" and not open_er_items()):
+    st.session_state["pipeline_state"]["phase"] = "resuming"
+    phase = "resuming"
     _persist()
 
 prog = activation_progress(
@@ -198,7 +197,7 @@ with left:
     if st.button(
         "Hard Reset",
         use_container_width=True,
-        help="Keep data/ + Bronze; clear Silver/Gold/context and restart at Semantics",
+        help="Keep data/ + Bronze; clear Silver/Gold/context and restart after Bronze",
     ):
         st.session_state["confirm_hard_reset"] = True
     if st.session_state.get("confirm_hard_reset"):
@@ -260,41 +259,31 @@ with center:
 
     if cont:
         action = continue_action(step)
-        open_gaps = open_review_items()
-        if action.get("require_hitl_clear") and open_gaps:
-            st.error(
-                f"Resolve open HITL gaps before continuing ({len(open_gaps)} still need_review)."
-            )
+        error = None
+        if action.get("require_hitl_clear") and open_review_items():
+            error = f"Resolve open HITL gaps before continuing ({len(open_review_items())} still need review)."
+        elif action.get("require_er_clear") and open_er_items():
+            error = f"Review uncertain entity matches before Silver ({len(open_er_items())} open)."
+        elif action.get("require_gold") and "gold" not in load_progress():
+            error = "Approve and build the Gold mart before Ask."
+        if error:
+            st.error(error)
         elif action.get("run"):
             run_to = action["run"]
             _run_stage(run_to)
-            phase_now = st.session_state.get("pipeline_state", {}).get("phase")
-            if phase_now != "awaiting_hitl":
+            phase_now = st.session_state.get("pipeline_state", {}).get("phase", "")
+            if not str(phase_now).startswith("awaiting_"):
                 if run_to == "silver" and not silver_ready_checklist()["ok"]:
                     st.session_state["walk_step"] = "silver"
-                    st.warning("Silver ran but checklist incomplete — review HITL / ER.")
+                    st.warning("Silver ran but the readiness checklist is incomplete.")
                 else:
                     st.session_state["walk_step"] = action["next"]
             _persist()
             st.rerun()
         else:
-            nxt = action.get("next", step)
-            if nxt == "connect" and open_review_items():
-                st.error(
-                    f"Clear HITL gaps before Connect ({len(open_review_items())} still open)."
-                )
-            elif step == "hitl" and not open_review_items():
-                # Promote phase so Connect unlocks after approvals
-                st.session_state.setdefault("pipeline_state", {})["phase"] = "context_done"
-                st.session_state["walk_step"] = nxt
-                _persist()
-                st.rerun()
-            elif nxt in {"gold", "ask"} and not silver_ready_checklist()["ok"]:
-                st.error("Silver-ready checklist must pass before Act 2.")
-            else:
-                st.session_state["walk_step"] = nxt
-                _persist()
-                st.rerun()
+            st.session_state["walk_step"] = action.get("next", step)
+            _persist()
+            st.rerun()
 
 # Persist whenever the radio changes step
 _persist()

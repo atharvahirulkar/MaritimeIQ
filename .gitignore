@@ -22,3 +22,4 @@ dist/
 build/
 .eval_results/
 data/
+lakehouse/.pii_salt

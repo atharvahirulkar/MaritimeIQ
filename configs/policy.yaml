@@ -16,26 +16,38 @@ insight_forbidden_layers:
 pii_masking:
   strategy: salted_hash
   salt_env: MARITIMEIQ_PII_SALT
-  default_salt: maritimeiq-hackathon-salt
+  # No default salt: if the env var is unset a random salt is generated once and
+  # kept in lakehouse/.pii_salt (gitignored) so tokens stay stable but private.
   patterns:
     email: '(?i)[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}'
-    phone: '(?:\+?\d[\d\s\-().]{7,}\d)'
+    # Grouped phone numbers (+1 310-555-0100, (020) 7946 0958); avoids ISO dates / plain IDs
+    phone: '(?<![\w-])\+?\(?\d{1,4}\)?[\s.-]\d{2,4}[\s.-]\d{3,4}(?:[\s.-]\d{2,4})?(?![\w-])'
     passport: '(?i)\b[A-Z]{1,2}\d{6,9}\b'
 
 # Gold writes require a human approval id
 gold_requires_approval: true
 approval_id_prefix: APPR-
 
-# Adversarial prompt patterns to block
+# Prompt patterns that always indicate a PII value request (blocked unless aggregate)
 adversarial_patterns:
   - passport
   - seaman.?s?\s*book
   - raw\s+pii
   - unmask
+  - de-?anonymi[sz]e
   - show\s+all\s+(passports|emails|phones|tax\s*ids?)
-  - drop\s+table
-  - delete\s+from
-  - truncate\s+table
+
+# PII nouns: asking for these values (not counts) is refused
+pii_terms:
+  - \be-?mails?\b
+  - \bphone(s| numbers?)?\b
+  - \btax\s*(id|ids|number|numbers)\b
+  - \bdate of birth\b
+  - \bdob\b
+  - \bhome address(es)?\b
+  - \bcontact (details|person|names?)\b
+  - \bcrew (names?|members'? names)\b
+  - \bpersonal (data|details|information)\b
 
 audit:
   path: lakehouse/context/audit_log.jsonl

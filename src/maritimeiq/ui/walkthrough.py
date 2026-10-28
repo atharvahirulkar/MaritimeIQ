@@ -81,24 +81,54 @@ def source_inventory() -> list[dict[str, Any]]:
     return rows
 
 
+def _progress() -> dict[str, str]:
+    from maritimeiq.agents.orchestrator import load_progress
+
+    return load_progress()
+
+
+def _open_er() -> list[dict[str, Any]]:
+    from maritimeiq.agents.entity_resolution import open_er_items
+
+    return open_er_items()
+
+
+def _silver_qc() -> dict[str, Any]:
+    path = CONTEXT / "silver_qc.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def silver_ready_checklist() -> dict[str, Any]:
     store = ContextStore()
     sem_tables = store.load_semantics().get("tables", {}) or {}
     bronze = _bronze_tables()
     silver = _silver_tables()
     hitl_open = len(open_review_items())
-    has_masters = any(
-        t.startswith("master_") or t.endswith("_aliases") or "record_map" in t for t in silver
-    )
+    er_open = len(_open_er())
+    business_bronze = [t for t in bronze if not t.startswith("ref_")]
+    missing_sem = [t for t in business_bronze if t not in sem_tables]
+    qc = _silver_qc()
+    qc_fail = [k for k, v in qc.items() if not v.get("ok")]
+    done = _progress()
     checks = [
-        {"id": "bronze", "label": "Bronze tables ingested", "ok": len(bronze) >= 3},
-        {"id": "semantics", "label": "Semantic layer approved for key tables", "ok": len(sem_tables) >= 1},
-        {"id": "hitl", "label": "No open HITL semantic gaps", "ok": hitl_open == 0},
-        {"id": "er", "label": "Entity masters present", "ok": has_masters},
+        {"id": "bronze", "label": "Bronze tables ingested", "ok": "bronze" in done and len(business_bronze) >= 3},
+        {
+            "id": "semantics",
+            "label": "Semantic layer covers every Bronze source"
+            + (f" (missing: {', '.join(missing_sem)})" if missing_sem else ""),
+            "ok": bool(business_bronze) and not missing_sem,
+        },
+        {"id": "hitl", "label": f"No open semantic HITL gaps ({hitl_open} open)", "ok": hitl_open == 0},
+        {"id": "er", "label": f"Entity masters built, no open match reviews ({er_open} open)", "ok": "er" in done and er_open == 0},
         {
             "id": "silver",
-            "label": "Silver fact tables present",
-            "ok": any(t in silver for t in ("port_agent_events", "ais_positions", "container_events")),
+            "label": "Silver built and every table passes QC" + (f" (failing: {', '.join(qc_fail)})" if qc_fail else ""),
+            "ok": "silver" in done and bool(qc) and not qc_fail,
         },
     ]
     return {
@@ -109,69 +139,40 @@ def silver_ready_checklist() -> dict[str, Any]:
         "gold_n": len(_gold_tables()),
         "sem_tables": len(sem_tables),
         "hitl_open": hitl_open,
+        "er_open": er_open,
     }
 
 
-def step_unlocked(step_id: str, phase: str | None) -> bool:
-    """Whether the user may navigate to this step (Trust always; others by progress)."""
-    if step_id == "trust":
-        return True
-    if step_id == "sources":
-        return True
-    phase = phase or "idle"
-    order = {
-        "idle": 0,
-        "bronze_done": 1,
-        "context_done": 2,
-        "awaiting_hitl": 2,
-        "er_done": 4,
-        "silver_done": 5,
-        "gold_done": 6,
-        "insight_done": 7,
-    }
-    rank = order.get(phase, 0)
-    need = {
-        "bronze": 0,
-        "semantics": 1,
-        "hitl": 2,
-        "connect": 3,
-        "silver": 4,
-        "gold": 5,
-        "ask": 6,
-    }
-    # Allow current + completed steps; also allow hitl whenever context ran
-    idx = STEP_IDS.index(step_id) if step_id in STEP_IDS else 0
-    if step_id == "hitl" and rank >= 2:
-        return True
-    if step_id == "ask":
-        return silver_ready_checklist()["ok"] and (
-            rank >= 5 or bool(load_gold_catalog().get("tables")) or len(_gold_tables()) > 0 or rank >= 6
-        )
-    if step_id == "gold":
-        return silver_ready_checklist()["ok"] or rank >= 5
-    # Map step to minimum phase rank
-    min_rank = need.get(step_id, 0)
-    if step_id == "bronze":
+def step_unlocked(step_id: str, phase: str | None = None) -> bool:
+    """Whether the user may navigate to this step (driven by persisted stage progress)."""
+    done = _progress()
+    if step_id in {"sources", "bronze", "trust"}:
         return True
     if step_id == "semantics":
-        return rank >= 1 or len(_bronze_tables()) > 0
+        return "bronze" in done
+    if step_id == "hitl":
+        return "context" in done
     if step_id == "connect":
-        return rank >= 3 or (rank >= 2 and len(open_review_items()) == 0)
+        return "er" in done
     if step_id == "silver":
-        return rank >= 4 or (SILVER.exists() and any(SILVER.iterdir()))
-    return rank >= min_rank
+        return "silver" in done or ("er" in done and not _open_er())
+    if step_id == "gold":
+        return "silver" in done
+    if step_id == "ask":
+        return "gold" in done
+    return False
 
 
 def continue_action(step_id: str) -> dict[str, Any]:
-    """What Continue should do from this step: pipeline through, or navigate only."""
+    """What Continue does from each step: the stage it runs and the gate it must pass."""
     mapping = {
-        "sources": {"next": "bronze", "run": None},
-        "bronze": {"next": "semantics", "run": "bronze"},
-        "semantics": {"next": "hitl", "run": "context"},
-        "hitl": {"next": "connect", "run": None, "require_hitl_clear": True},
-        "connect": {"next": "silver", "run": "er"},
-        "silver": {"next": "gold", "run": "silver"},
-        "gold": {"next": "ask", "run": "gold"},
+        "sources": {"next": "bronze", "run": "bronze"},
+        "bronze": {"next": "semantics", "run": "context"},
+        "semantics": {"next": "hitl", "run": None},
+        "hitl": {"next": "connect", "run": "er", "require_hitl_clear": True},
+        "connect": {"next": "silver", "run": "silver", "require_er_clear": True},
+        "silver": {"next": "gold", "run": "gold", "require_silver_ready": True},
+        "gold": {"next": "ask", "run": None, "require_gold": True},
         "ask": {"next": "trust", "run": None},
         "trust": {"next": "trust", "run": None},
     }
@@ -198,27 +199,19 @@ def load_walk_session() -> dict[str, Any] | None:
 
 
 def infer_resume_step(phase: str | None = None) -> tuple[str, str]:
-    """Return (walk_step, phase) from disk progress when session is missing."""
-    ready = silver_ready_checklist()
-    open_hitl = len(open_review_items())
-    gold_n = len(_gold_tables())
-    silver_n = len(_silver_tables())
-    bronze_n = len(_bronze_tables())
-    sem_n = ready["sem_tables"]
-
-    if phase in {"insight_done", "gold_done"} or gold_n:
-        return "ask" if gold_n else "gold", phase or ("gold_done" if gold_n else "silver_done")
-    if phase == "silver_done" or (silver_n and ready["ok"]):
-        return "gold" if ready["ok"] else "silver", phase or "silver_done"
-    if phase == "er_done" or (silver_n and any(t.startswith("master_") for t in _silver_tables())):
-        return "silver", phase or "er_done"
-    if phase == "awaiting_hitl" or (sem_n and open_hitl):
-        return "hitl", "awaiting_hitl"
-    if phase == "context_done" or (sem_n and not open_hitl):
-        return "connect" if sem_n else "semantics", phase or ("context_done" if sem_n else "bronze_done")
-    if phase == "bronze_done" or bronze_n:
-        return "semantics" if bronze_n else "bronze", phase or ("bronze_done" if bronze_n else "idle")
-    return "sources", phase or "idle"
+    """Return (walk_step, phase) from persisted stage progress when the session file is missing."""
+    done = _progress()
+    if "gold" in done:
+        return "ask", "gold_done"
+    if "silver" in done:
+        return "gold", "silver_done"
+    if "er" in done:
+        return "connect", "er_done"
+    if "context" in done:
+        return "hitl", "awaiting_hitl" if open_review_items() else "context_done"
+    if "bronze" in done:
+        return "semantics", "bronze_done"
+    return "sources", "idle"
 
 
 def hard_reset_walkthrough() -> dict[str, Any]:
@@ -246,8 +239,12 @@ def hard_reset_walkthrough() -> dict[str, Any]:
         root.mkdir(parents=True, exist_ok=True)
 
     bronze_n = len(_bronze_tables())
+    from maritimeiq.agents.orchestrator import mark_done, reset_progress
+
+    reset_progress()
     if bronze_n:
-        step, phase = "semantics", "bronze_done"
+        mark_done("bronze")  # Bronze is kept, so its stage stays complete
+        step, phase = "bronze", "bronze_done"
     else:
         step, phase = "sources", "idle"
     save_walk_session(step, {"phase": phase}, hitl_resolved_count=0)
@@ -309,14 +306,14 @@ def cleanup_summary() -> dict[str, Any]:
     masters = [t for t in silver if t.startswith("master_") or "alias" in t or "record_map" in t]
     return {
         "rows": [
-            {"Aspect": "Source folders", "Before (messy)": len(sources) or "—", "After (activated)": len(bronze) or "—"},
-            {"Aspect": "Raw Bronze tables", "Before (messy)": len(bronze) or "—", "After (activated)": "Governed via Silver"},
-            {"Aspect": "Field semantics", "Before (messy)": "Unknown / undocumented", "After (activated)": f"{fields} fields approved"},
-            {"Aspect": "PII tags", "Before (messy)": "Untracked", "After (activated)": f"{pii} columns tagged + masked"},
-            {"Aspect": "HITL gaps", "Before (messy)": "Unresolved meanings", "After (activated)": f"{len(open_review_items())} open"},
-            {"Aspect": "Entity masters", "Before (messy)": "Siloed keys", "After (activated)": f"{len(masters)} link tables"},
-            {"Aspect": "Silver tables", "Before (messy)": "—", "After (activated)": len(silver) or "—"},
-            {"Aspect": "Gold mart tables", "Before (messy)": "—", "After (activated)": len(gold) or "—"},
+            {"Aspect": "Source folders", "Before (messy)": str(len(sources) or "—"), "After (activated)": str(len(bronze) or "—")},
+            {"Aspect": "Raw Bronze tables", "Before (messy)": str(len(bronze) or "—"), "After (activated)": str("Governed via Silver")},
+            {"Aspect": "Field semantics", "Before (messy)": str("Unknown / undocumented"), "After (activated)": str(f"{fields} fields approved")},
+            {"Aspect": "PII tags", "Before (messy)": str("Untracked"), "After (activated)": str(f"{pii} columns tagged + masked")},
+            {"Aspect": "HITL gaps", "Before (messy)": str("Unresolved meanings"), "After (activated)": str(f"{len(open_review_items())} open")},
+            {"Aspect": "Entity masters", "Before (messy)": str("Siloed keys"), "After (activated)": str(f"{len(masters)} link tables")},
+            {"Aspect": "Silver tables", "Before (messy)": str("—"), "After (activated)": str(len(silver) or "—")},
+            {"Aspect": "Gold mart tables", "Before (messy)": str("—"), "After (activated)": str(len(gold) or "—")},
         ],
         "narrative": (
             f"Started from {len(sources) or 'raw'} source folder(s) landed as {len(bronze)} messy Bronze tables. "
@@ -331,7 +328,8 @@ def gold_dim_model_mermaid(proposals: list[dict[str, Any]] | None = None) -> str
     catalog = load_gold_catalog()
     props = proposals or catalog.get("tables") or []
     dims = [p for p in props if p.get("kind") == "dimension"]
-    facts = [p for p in props if p.get("kind") in {"fact", "aggregate"}]
+    facts = [p for p in props if p.get("kind", "kpi") in {"fact", "aggregate"}]
+    kpis = [p for p in props if p.get("kind", "kpi") == "kpi"]
     views = [p for p in props if p.get("kind") == "view"]
     lines = ["flowchart LR"]
     for d in dims:
@@ -343,6 +341,12 @@ def gold_dim_model_mermaid(proposals: list[dict[str, Any]] | None = None) -> str
         for d in dims:
             dn = d["table_name"].replace("gold.", "").replace("-", "_")
             lines.append(f"  {dn} --> {nid}")
+    for k in kpis:
+        nid = k["table_name"].replace("gold.", "").replace("-", "_")
+        lines.append(f'  {nid}(["{k["table_name"]}"])')
+        for f in facts[:2]:
+            fn = f["table_name"].replace("gold.", "").replace("-", "_")
+            lines.append(f"  {fn} --> {nid}")
     for v in views:
         nid = v["table_name"].replace("gold.", "").replace("-", "_")
         lines.append(f'  {nid}["{v["table_name"]}"]')

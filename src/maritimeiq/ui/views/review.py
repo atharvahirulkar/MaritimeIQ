@@ -82,8 +82,8 @@ def render_review(orch, *, embedded: bool = False) -> None:
     visible = items if filter_table == "All tables" else [it for it in items if it["table"] == filter_table]
 
     st.caption(
-        "Pick Approve / Reject / Edit on each row. Choosing Edit unlocks the New meaning column. "
-        "Then click Apply decisions."
+        "Pick Approve / Reject / Edit on each row and fix the PII flag if the agent got it wrong. "
+        "Edit unlocks the New meaning column. Then click Apply decisions — your guidance is reused for later sources."
     )
 
     # Header
@@ -115,7 +115,8 @@ def render_review(orch, *, embedded: bool = False) -> None:
         row[2].caption(meaning or "—")
         row[3].markdown(grade)
         row[4].markdown(f"{float(it.get('score') or 0):.2f}")
-        row[5].markdown("Yes" if it.get("pii") else "—")
+        with row[5]:
+            st.checkbox("PII", value=bool(it.get("pii")), key=f"hitl_pii_{rk}", label_visibility="collapsed")
 
         # Default Approve for faster checks (wrong grades default to Edit)
         default_idx = 2 if it.get("grade") == "wrong" else 0
@@ -167,7 +168,8 @@ def render_review(orch, *, embedded: bool = False) -> None:
                 if not edited:
                     skipped_edit += 1
                     continue
-            res = ctx.apply_human_decision(it["table"], it["column"], decision, edited)
+            pii_flag = st.session_state.get(f"hitl_pii_{rk}", bool(it.get("pii")))
+            res = ctx.apply_human_decision(it["table"], it["column"], decision, edited, pii=pii_flag)
             if res.get("ok"):
                 applied += 1
                 FEED.emit(
@@ -179,7 +181,7 @@ def render_review(orch, *, embedded: bool = False) -> None:
                     decision=decision,
                 )
             # Clear row widget state so removed gaps don't linger
-            for k in (f"hitl_act_{rk}", f"hitl_new_{rk}"):
+            for k in (f"hitl_act_{rk}", f"hitl_new_{rk}", f"hitl_pii_{rk}"):
                 if k in st.session_state:
                     del st.session_state[k]
 
@@ -188,7 +190,7 @@ def render_review(orch, *, embedded: bool = False) -> None:
             st.success(f"Applied {applied} decision(s). Gaps removed from the queue.")
             # If queue empty, allow Continue past HITL
             if not open_review_items():
-                st.session_state.setdefault("pipeline_state", {})["phase"] = "context_done"
+                st.session_state.setdefault("pipeline_state", {})["phase"] = "resuming"
                 try:
                     from maritimeiq.ui.walkthrough import save_walk_session
 
