@@ -11,7 +11,6 @@ BRONZE = LAKEHOUSE / "bronze"
 SILVER = LAKEHOUSE / "silver"
 GOLD = LAKEHOUSE / "gold"
 CONTEXT = LAKEHOUSE / "context"
-CHECKPOINTS = LAKEHOUSE / "checkpoints"
 SOURCES = ROOT / "data" / "hackathon" / "sources"
 GROUND_TRUTH = ROOT / "data" / "hackathon" / "ground_truth"
 POLICY_PATH = CONFIGS / "policy.yaml"
@@ -19,5 +18,5 @@ SPARK_CFG = CONFIGS / "spark.yaml"
 
 
 def ensure_lakehouse_dirs() -> None:
-    for p in (BRONZE, SILVER, GOLD, CONTEXT, CHECKPOINTS):
+    for p in (BRONZE, SILVER, GOLD, CONTEXT):
         p.mkdir(parents=True, exist_ok=True)

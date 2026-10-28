@@ -22,3 +22,8 @@ dist/
 build/
 .eval_results/
 data/
+lakehouse/_reset_backup_*/
+lakehouse/context_backup_*/
+web/node_modules/
+web/dist/
+*.tsbuildinfo

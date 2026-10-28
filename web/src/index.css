@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg0: #071018;
+  --color-bg1: #0f1c28;
+  --color-bg2: #152636;
+  --color-panel: #121f2c;
+  --color-foam: #e6edf2;
+  --color-muted: #8aa0b2;
+  --color-brass: #c9a227;
+  --color-teal: #2a8f8a;
+  --color-danger: #c45c5c;
+  --color-ok: #3d9a6a;
+  --color-hairline: rgba(201, 162, 39, 0.22);
+  --font-display: "Fraunces", Georgia, serif;
+  --font-ui: "Sora", "Helvetica Neue", sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  color: var(--color-foam);
+  font-family: var(--font-ui);
+  background: linear-gradient(165deg, #071018 0%, #0f1c28 48%, #0c1822 100%) fixed;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.05;
+  background-image:
+    linear-gradient(rgba(138, 160, 178, 0.8) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(138, 160, 178, 0.8) 1px, transparent 1px);
+  background-size: 64px 64px;
+}
+
+@utility panel {
+  @apply rounded-md border border-hairline bg-panel/80 backdrop-blur;
+}
+@utility kpi {
+  @apply rounded-md border border-hairline border-l-4 border-l-teal bg-panel/80 px-4 py-3;
+}
+@utility btn {
+  @apply cursor-pointer rounded-md border border-hairline px-4 py-2 text-sm font-medium transition hover:border-brass disabled:cursor-not-allowed disabled:opacity-40;
+}
+@utility btn-primary {
+  @apply cursor-pointer rounded-md border border-teal/60 bg-teal px-4 py-2 text-sm font-semibold text-bg0 transition hover:bg-teal/85 disabled:cursor-not-allowed disabled:opacity-40;
+}
+@utility chip {
+  @apply inline-block rounded border border-teal/30 bg-teal/10 px-2 py-0.5 text-xs;
+}
+@utility input {
+  @apply w-full rounded-md border border-hairline bg-bg1 px-3 py-2 text-sm outline-none focus:border-brass;
+}
+
+.tbl {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 0.85rem;
+}
+.tbl th {
+  position: sticky;
+  top: 0;
+  background: var(--color-bg2);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--color-muted);
+  text-transform: uppercase;
+  z-index: 1;
+}
+.tbl td {
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  padding: 0.5rem 0.75rem;
+  vertical-align: top;
+}
+
+.react-flow__attribution {
+  display: none;
+}
