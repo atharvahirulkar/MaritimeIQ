@@ -1,4 +1,4 @@
-"""In-memory agent event feed for Streamlit + demos."""
+"""Agent event feed: in-memory for live streaming, appended to agent_feed.jsonl for history."""
 from __future__ import annotations
 
 import json
@@ -38,6 +38,11 @@ class AgentFeed:
     def recent(self, n: int = 100) -> list[dict[str, Any]]:
         with self._lock:
             return [asdict(e) for e in self._events[-n:]]
+
+    def since(self, cursor: int) -> tuple[int, list[dict[str, Any]]]:
+        """Events after position `cursor`, plus the new cursor (for streaming)."""
+        with self._lock:
+            return len(self._events), [asdict(e) for e in self._events[cursor:]]
 
     def clear(self) -> None:
         with self._lock:

@@ -15,7 +15,7 @@ from pyspark.sql.types import StringType, StructField, StructType
 
 from maritimeiq.mcp.tools import MCPGateway
 from maritimeiq.utils.logging_feed import FEED
-from maritimeiq.utils.paths import BRONZE, CHECKPOINTS, SOURCES, ensure_lakehouse_dirs
+from maritimeiq.utils.paths import SOURCES, ensure_lakehouse_dirs
 
 LINEAGE = ["_source_file", "_ingested_at", "_row_hash", "_source_system"]
 
@@ -71,11 +71,12 @@ class IngestionAgent:
         self.gateway = gateway
         ensure_lakehouse_dirs()
 
-    def run(self, state: dict[str, Any]) -> dict[str, Any]:
+    def run(self, state: dict[str, Any] | None = None) -> dict[str, Any]:
+        state = dict(state or {})
         FEED.emit("ingestion", "Starting Bronze ingestion")
         results: dict[str, Any] = {}
         results["ais_positions"] = self.ingest_ais_positions()
-        results["ais_live"] = self.ingest_ais_live(batch=True)
+        results["ais_live"] = self.ingest_ais_live()
         results["port_agent_calls"] = self.ingest_port_agent_calls()
         results["carrier_schedules"] = self.ingest_carrier_schedules()
         results["bills_of_lading"] = self.ingest_bills_of_lading()
@@ -93,8 +94,6 @@ class IngestionAgent:
         count = df.count()
         out = self.gateway.lakehouse.write_delta(df, f"bronze.{table}", mode="overwrite", agent="ingestion")
         out["rows"] = count
-        # register temp view for SQL
-        self.spark.read.format("delta").load(str(BRONZE / table)).createOrReplaceTempView(f"bronze_{table}")
         return out
 
     def ingest_ais_positions(self) -> dict[str, Any]:
@@ -168,29 +167,13 @@ class IngestionAgent:
         FEED.emit("ingestion", f"ais_positions loaded v1={len(v1_files)} v2={len(v2_files)}")
         return self._write(df, "ais_positions")
 
-    def ingest_ais_live(self, batch: bool = True) -> dict[str, Any]:
-        path = SOURCES / "ais_live" / "AIS_2021_10_15_LALB.csv"
-        if batch:
-            df = self.spark.read.option("header", True).csv(str(path))
-            df = _add_lineage(df, str(path), "ais_live")
-            return self._write(df, "ais_live")
-        # Structured Streaming micro-batch fallback path
-        CHECKPOINTS.mkdir(parents=True, exist_ok=True)
-        stream_df = (
-            self.spark.readStream.option("header", True)
-            .schema(self.spark.read.option("header", True).csv(str(path)).schema)
-            .csv(str(path.parent))
-        )
-        stream_df = _add_lineage(stream_df, str(path), "ais_live")
-        query = (
-            stream_df.writeStream.format("delta")
-            .option("checkpointLocation", str(CHECKPOINTS / "ais_live"))
-            .outputMode("append")
-            .start(str(BRONZE / "ais_live_stream"))
-        )
-        query.processAllAvailable()
-        query.stop()
-        return {"ok": True, "rows": self.spark.read.format("delta").load(str(BRONZE / "ais_live_stream")).count()}
+    def ingest_ais_live(self) -> dict[str, Any]:
+        files = sorted(str(p) for p in (SOURCES / "ais_live").glob("*.csv"))
+        if not files:
+            return {"ok": False, "rows": 0}
+        df = self.spark.read.option("header", True).csv(files)
+        df = _add_lineage(df, ",".join(files), "ais_live")
+        return self._write(df, "ais_live")
 
     def ingest_port_agent_calls(self) -> dict[str, Any]:
         root = SOURCES / "port_agent_calls"
@@ -480,27 +463,19 @@ class IngestionAgent:
                 if header_idx is None:
                     continue
                 headers = [str(c).strip() if c is not None else f"col{j}" for j, c in enumerate(data[header_idx])]
-                # Meta from header block
-                ship_name = None
-                imo = None
-                port = None
+                # Header block is "Label:" / value pairs (ship, IMO, port of arrival, date).
+                meta: dict[str, str] = {}
                 for row in data[:header_idx]:
-                    vals = [str(c) for c in row if c is not None]
-                    line = " ".join(vals)
-                    if "IMO" in line.upper():
-                        for tok in line.replace(":", " ").split():
-                            if tok.isdigit() and len(tok) == 7:
-                                imo = tok
-                    if ship_name is None and vals:
-                        # heuristic: first non-empty label-ish
-                        for v in vals:
-                            if len(str(v)) > 3 and "crew" not in str(v).lower():
-                                ship_name = str(v)
-                                break
-                    if port is None:
-                        for v in vals:
-                            if isinstance(v, str) and (len(v) == 5 and v.isupper()):
-                                port = v
+                    vals = [c for c in row if c is not None and str(c).strip()]
+                    for j, v in enumerate(vals[:-1]):
+                        label = str(v).strip().lower()
+                        if label.endswith(":"):
+                            meta[label] = str(vals[j + 1]).strip()
+                ship_name = next((v for k, v in meta.items() if "ship" in k or "vessel" in k), None)
+                imo_txt = next((v for k, v in meta.items() if "imo" in k), "")
+                imo = next((t for t in re.findall(r"\d{7}", imo_txt)), None)
+                port = next((v for k, v in meta.items() if "port" in k), None)
+                arrival = next((v for k, v in meta.items() if k.startswith("date")), None)
                 for row in data[header_idx + 1 :]:
                     if all(c is None or str(c).strip() == "" for c in row):
                         continue
@@ -510,6 +485,7 @@ class IngestionAgent:
                     norm["vessel_name_meta"] = ship_name
                     norm["imo_meta"] = imo
                     norm["port_meta"] = port
+                    norm["arrival_date_meta"] = arrival
                     norm["sheet"] = sheet
                     norm["_source_file"] = str(fp)
                     norm["_ingested_at"] = _now()

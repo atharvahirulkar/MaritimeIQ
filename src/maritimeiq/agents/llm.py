@@ -105,38 +105,15 @@ def _heuristic_column(name: str, samples: list[Any]) -> ColumnProposal:
 class LLMClient:
     def __init__(self) -> None:
         load_env()
-        self.provider = (os.environ.get("MARITIMEIQ_LLM_PROVIDER") or "openai").lower()
         self.model = os.environ.get("MARITIMEIQ_MODEL", "gpt-4o-mini")
         self.api_key = os.environ.get("OPENAI_API_KEY")
         self._client = None
-        self._vertex = None
         self.last_source: str = "none"
-        self._init_client()
-
-    def _init_client(self) -> None:
-        if self.provider == "vertex":
-            # Vertex via OpenAI-compatible endpoint or google-genai when configured
-            project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
-            location = os.environ.get("VERTEX_LOCATION", "us-central1")
-            # Prefer OpenAI-compatible Vertex endpoint if key/base set
-            base = os.environ.get("OPENAI_BASE_URL") or os.environ.get("VERTEX_OPENAI_BASE_URL")
-            key = os.environ.get("OPENAI_API_KEY") or os.environ.get("VERTEX_API_KEY") or "unused"
-            if base:
-                try:
-                    from openai import OpenAI
-
-                    self._client = OpenAI(api_key=key, base_url=base)
-                    self.model = os.environ.get("MARITIMEIQ_MODEL", "google/gemini-2.0-flash")
-                    return
-                except Exception:  # noqa: BLE001
-                    self._client = None
-            self._vertex = {"project": project, "location": location}
-            return
         if self.api_key:
             try:
                 from openai import OpenAI
 
-                self._client = OpenAI(api_key=self.api_key)
+                self._client = OpenAI(api_key=self.api_key, base_url=os.environ.get("OPENAI_BASE_URL") or None)
             except Exception:  # noqa: BLE001
                 self._client = None
 

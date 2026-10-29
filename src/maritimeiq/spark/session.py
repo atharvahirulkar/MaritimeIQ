@@ -39,6 +39,7 @@ def get_spark(app_name: str | None = None) -> SparkSession:
         .config("spark.ui.enabled", "false")
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.sql.session.timeZone", "UTC")
+        .config("spark.sql.legacy.timeParserPolicy", "CORRECTED")
     )
     spark = configure_spark_with_delta_pip(builder).getOrCreate()
     spark.sparkContext.setLogLevel("WARN")

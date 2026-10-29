@@ -4,14 +4,11 @@ pydantic==2.10.6
 pyyaml==6.0.2
 rapidfuzz==3.12.1
 openpyxl==3.1.5
-streamlit==1.42.2
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
 httpx==0.28.1
 python-dotenv==1.0.1
 pandas==2.2.3
 pyarrow==19.0.1
 pytest==8.3.5
-rich==13.9.4
-mcp==1.6.0
-langgraph==0.3.5
-langchain-core==0.3.45
 openai==1.66.3

@@ -1,467 +1,495 @@
-"""Transformation agent: Bronze + semantics + masters → Silver."""
+"""Transformation agent: Bronze + semantic layer + HITL mappings + masters → Silver.
+
+Every table records what was cleaned (duplicates, unparsed timestamps, unresolved keys,
+masked PII) into ``cleanup_report.json``; Silver column semantics and cross-table
+relationships are written back into the semantic layer for Gold and Ask.
+"""
 from __future__ import annotations
 
 import hashlib
-import re
 from typing import Any
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType
+from pyspark.sql.window import Window
+from rapidfuzz import fuzz, process
 
-from maritimeiq.agents.entity_resolution import clean_imo, normalize_port, normalize_vessel_name
+from maritimeiq.agents.vocab import (
+    CONTAINER_EVENTS,
+    PORT_EVENTS,
+    SILVER_COLUMN_DOCS,
+    PortResolver,
+    map_container_event,
+    map_port_event,
+    normalize_vessel_name,
+)
+from maritimeiq.context_store.store import ContextStore
 from maritimeiq.governance.guard import GUARD
 from maritimeiq.mcp.tools import MCPGateway
 from maritimeiq.utils.logging_feed import FEED
 from maritimeiq.utils.paths import BRONZE, SILVER, ensure_lakehouse_dirs
 
+CLEANUP_REPORT = "cleanup_report.json"
+PII_NAME_HINTS = ["passport", "dob", "birth", "surname", "family", "given", "first_name", "seaman",
+                  "cdc", "email", "phone", "contact", "street", "tax", "owner"]
 
-def _hash_udf(salt: str):
-    def _h(v: str | None) -> str | None:
-        if v is None:
-            return None
-        return "tok_" + hashlib.sha256(f"{salt}:{v}".encode()).hexdigest()[:16]
+TABLE_DOCS = {
+    "ais_positions": "Vessel AIS position reports (history), linked to master_vessel",
+    "ais_live": "Live AIS snapshot for LA/Long Beach",
+    "port_agent_events": "Port call milestones (ETA, anchored, berthed, cargo ops, sailed) from port agents",
+    "carrier_schedules": "Published carrier sailing schedules (ETA/ETD per port call)",
+    "bills_of_lading": "Bill of lading container lines (latest amendment), shipper/consignee linked to customers",
+    "container_events": "Unified container milestones from DCSA, EDI, and legacy carrier feeds",
+    "customers": "CRM accounts linked to master_customer",
+    "crew_manifests": "Crew lists per vessel arrival (personal fields masked)",
+    "master_vessel": "One row per resolved vessel (IMO-centric), with name/MMSI counts",
+    "vessel_aliases": "Vessel name/MMSI aliases → master_vessel_id",
+    "master_port": "One row per UN/LOCODE port",
+    "port_aliases": "Port aliases (names, abbreviations, human mappings) → master_port",
+    "master_customer": "One row per resolved customer",
+    "customer_record_map": "CRM record → master_customer_id",
+}
 
-    return F.udf(_h, StringType())
+ENTITY_KEYS = {
+    "master_vessel_id": ("master_vessel", "master_vessel_id"),
+    "master_port": ("master_port", "master_port"),
+    "pol": ("master_port", "master_port"),
+    "pod": ("master_port", "master_port"),
+    "destination_port": ("master_port", "master_port"),
+    "master_customer_id": ("master_customer", "master_customer_id"),
+    "shipper_customer_id": ("master_customer", "master_customer_id"),
+    "consignee_customer_id": ("master_customer", "master_customer_id"),
+}
+
+
+def _imo(c: Column) -> Column:
+    s = F.regexp_replace(F.regexp_replace(F.trim(c.cast("string")), r"\.0$", ""), "[^0-9]", "")
+    return F.when(F.length(s) == 7, s)
+
+
+def _vname(c: Column) -> Column:
+    s = F.upper(F.trim(c.cast("string")))
+    s = F.regexp_replace(s, r"^(M/?V|MT|SS)\s+", "")
+    s = F.regexp_replace(s, r"[^A-Z0-9 ]", " ")
+    return F.trim(F.regexp_replace(s, r"\s+", " "))
+
+
+def _ts(*exprs: Column) -> Column:
+    return F.coalesce(*exprs)
+
+
+def _teu(c: Column) -> Column:
+    size = F.regexp_extract(c.cast("string"), r"^(\d{2})", 1)
+    return F.when(size == "20", F.lit(1)).when(size.isin("40", "45"), F.lit(2))
 
 
 class TransformationAgent:
     def __init__(self, spark: SparkSession, gateway: MCPGateway) -> None:
         self.spark = spark
         self.gateway = gateway
+        self.store = ContextStore()
         ensure_lakehouse_dirs()
-        self.hash_fn = _hash_udf(GUARD.salt)
+        salt = GUARD.salt
+        self.hash_fn = F.udf(
+            lambda v: None if v is None else "tok_" + hashlib.sha256(f"{salt}:{v}".encode()).hexdigest()[:16],
+            StringType(),
+        )
 
-    def run(self, state: dict[str, Any]) -> dict[str, Any]:
-        FEED.emit("transform", "Building Silver tables")
-        results = {}
-        results["ais_positions"] = self.silver_ais_positions()
-        results["ais_live"] = self.silver_ais_live()
-        results["port_agent_events"] = self.silver_port_agent_events()
-        results["carrier_schedules"] = self.silver_carrier_schedules()
-        results["bills_of_lading"] = self.silver_bills_of_lading()
-        results["container_events"] = self.silver_container_events()
-        results["customers"] = self.silver_customers()
-        results["crew_manifests"] = self.silver_crew_manifests()
-        state["silver_tables"] = results
-        state["phase"] = "silver_done"
-        FEED.emit("transform", "Silver complete", tables={k: v.get("rows") for k, v in results.items()})
+    # --- orchestration ----------------------------------------------------------
+    def run(self, state: dict[str, Any] | None = None) -> dict[str, Any]:
+        state = dict(state or {})
+        FEED.emit("transform", "Building Silver from Bronze + semantics + HITL mappings")
+        self.mappings = self.store.load_mappings()
+        self.resolver = PortResolver(self.mappings["port"])
+        self.report: dict[str, Any] = {}
+        self.sources: dict[str, str] = {}
+        self._prep: dict[str, dict[str, Any]] = {}
+        builders = [
+            ("ais_positions", self.silver_ais_positions),
+            ("ais_live", self.silver_ais_live),
+            ("port_agent_calls", self.silver_port_agent_events),
+            ("carrier_schedules", self.silver_carrier_schedules),
+            ("bills_of_lading", self.silver_bills_of_lading),
+            ("container_events", self.silver_container_events),
+            ("customers", self.silver_customers),
+            ("crew_manifests", self.silver_crew_manifests),
+        ]
+        for bronze, fn in builders:
+            if (BRONZE / bronze).exists():
+                fn()
+        self.store.save_json(CLEANUP_REPORT, self.report)
+        self._write_silver_semantics()
+        state["silver_tables"] = {k: v.get("silver_rows") for k, v in self.report.items()}
+        FEED.emit("transform", "Silver complete", event_type="silver_complete", tables=state["silver_tables"])
         return state
 
-    def _qc(self, df: DataFrame, name: str) -> dict[str, Any]:
+    # --- shared helpers ---------------------------------------------------------
+    def _bronze(self, name: str, silver: str) -> DataFrame:
+        df = self.spark.read.format("delta").load(str(BRONZE / name))
         n = df.count()
-        assert n >= 0
-        # no cleartext passport-like if masked columns exist
-        return {"ok": True, "rows": n, "table": name}
+        if "_row_hash" in df.columns:
+            df = df.dropDuplicates(["_row_hash"])
+        kept = df.count()
+        self._prep[silver] = {"source": name, "bronze_rows": n, "duplicates_removed": n - kept}
+        self.sources[silver] = name
+        return df
 
-    def _write_silver(self, df: DataFrame, name: str) -> dict[str, Any]:
-        qc = self._qc(df, name)
+    def _silver(self, name: str) -> DataFrame | None:
+        p = SILVER / name
+        return self.spark.read.format("delta").load(str(p)) if p.exists() else None
+
+    @staticmethod
+    def _lit_map(mapping: dict[str, str | None]) -> Column | None:
+        items = [x for k, v in mapping.items() if v for x in (F.lit(k), F.lit(v))]
+        return F.create_map(*items) if items else None
+
+    def _resolve_ports(self, df: DataFrame, src: Column, out: str) -> DataFrame:
+        df = df.withColumn("__p", F.upper(F.trim(src.cast("string"))))
+        vals = [r[0] for r in df.select("__p").distinct().collect() if r[0]]
+        m = self._lit_map({v: self.resolver.resolve(v)[0] for v in vals})
+        df = df.withColumn(out, m[F.col("__p")] if m is not None else F.lit(None).cast("string"))
+        return df.drop("__p")
+
+    def _map_codes(self, df: DataFrame, raw: Column, out: str, domain: str, feed: str | None = None) -> DataFrame:
+        overrides = self.mappings[domain]
+        key = F.upper(F.trim(raw.cast("string")))
+        if feed:
+            key = F.when(key.isNotNull(), F.concat(F.coalesce(F.col(feed), F.lit("")), F.lit("|"), key))
+        df = df.withColumn("__k", key)
+        mapping = {}
+        for r in df.select("__k").distinct().collect():
+            k = r[0]
+            if not k:
+                continue
+            f, v = k.split("|", 1) if feed else (None, k)
+            mapping[k] = (map_container_event(f, v, overrides) if domain == "container_event"
+                          else map_port_event(v, overrides))
+        m = self._lit_map(mapping)
+        df = df.withColumn(out, m[F.col("__k")] if m is not None else F.lit(None).cast("string"))
+        return df.drop("__k")
+
+    def _attach_vessel(self, df: DataFrame, imo: Column | None, name: Column | None) -> DataFrame:
+        masters = self._silver("master_vessel")
+        df = df.withColumn("imo", _imo(imo) if imo is not None else F.lit(None).cast("string"))
+        if masters is None:
+            return df.withColumn("master_vessel_id", F.lit(None).cast("string"))
+        df = df.join(
+            F.broadcast(masters.select("master_vessel_id", F.col("imo").alias("__mimo")).where(F.col("__mimo").isNotNull())),
+            F.col("imo") == F.col("__mimo"), "left",
+        ).drop("__mimo")
+        aliases = self._silver("vessel_aliases")
+        if name is not None and aliases is not None:
+            unique = (
+                aliases.where(F.col("alias_type") == "name")
+                .groupBy("alias").agg(F.countDistinct("master_vessel_id").alias("n"), F.first("master_vessel_id").alias("__avid"))
+                .where("n = 1").select(F.col("alias").alias("__alias"), "__avid")
+            )
+            df = (
+                df.withColumn("__vn", _vname(name))
+                .join(F.broadcast(unique), F.col("__vn") == F.col("__alias"), "left")
+                .withColumn("master_vessel_id", F.coalesce("master_vessel_id", "__avid"))
+                .drop("__vn", "__alias", "__avid")
+            )
+        return df
+
+    def _customer_map(self, names: list[str]) -> dict[str, str]:
+        crm = self._silver("customer_record_map")
+        if crm is None or not names:
+            return {}
+        accounts = {}
+        for r in crm.select("account_name", "master_customer_id").collect():
+            if r[0]:
+                accounts.setdefault(normalize_vessel_name(r[0]), r[1])
+        keys = list(accounts.keys())
+        out = {}
+        for n in names:
+            best = process.extractOne(normalize_vessel_name(n), keys, scorer=fuzz.token_set_ratio)
+            if best and best[1] >= 92:
+                out[n] = accounts[best[0]]
+        return out
+
+    def _mask_pii(self, df: DataFrame, bronze: str, silver: str) -> DataFrame:
+        sem = (self.store.load_semantics().get("tables", {}).get(bronze) or {}).get("columns") or []
+        tagged = {c["name"] for c in sem if c.get("pii") and (c.get("pii_class") or "direct") != "quasi"}
+        cols = [
+            c for c in df.columns
+            if not c.startswith("_") and not c.endswith("_masked")
+            and (c in tagged or any(k in c.lower() for k in PII_NAME_HINTS))
+        ]
+        for c in cols:
+            df = df.withColumn(f"{c}_masked", self.hash_fn(F.col(c).cast("string"))).drop(c)
+        self._prep.setdefault(silver, {})["pii_masked"] = cols
+        return df
+
+    def _write(self, df: DataFrame, name: str, checks: dict[str, Column] | None = None) -> None:
+        checks = checks or {}
+        aggs = [F.count(F.lit(1)).alias("__n")] + [
+            F.sum(F.when(expr, 1).otherwise(0)).alias(label) for label, expr in checks.items()
+        ]
+        stats = df.agg(*aggs).collect()[0].asDict()
         self.gateway.lakehouse.write_delta(df, f"silver.{name}", agent="transform")
-        self.spark.read.format("delta").load(str(SILVER / name)).createOrReplaceTempView(f"silver_{name}")
-        return qc
+        self.report[name] = {
+            **self._prep.get(name, {}),
+            "silver_rows": stats["__n"],
+            "issues_remaining": {k: int(stats[k] or 0) for k in checks},
+        }
+        FEED.emit("transform", f"silver.{name}: {stats['__n']} rows", table=name)
 
-    def _vessel_alias_map(self) -> DataFrame | None:
-        path = SILVER / "vessel_aliases"
-        if not path.exists():
-            return None
-        return self.spark.read.format("delta").load(str(path))
-
-    def silver_ais_positions(self) -> dict[str, Any]:
-        df = self.spark.read.format("delta").load(str(BRONZE / "ais_positions"))
-        # NavStatus may be numeric (v1) or text (v2)
+    # --- tables -----------------------------------------------------------------
+    def silver_ais_positions(self) -> None:
+        df = self._bronze("ais_positions", "ais_positions")
+        df = df.withColumn("lat", F.col("LAT").cast("double")).withColumn("lon", F.col("LON").cast("double"))
+        island = df.where((F.col("lat") == 0) & (F.col("lon") == 0)).count()
+        df = df.where(~((F.col("lat") == 0) & (F.col("lon") == 0)))
+        self._prep["ais_positions"]["null_island_dropped"] = island
         nav = F.lower(F.coalesce(F.col("NavStatus").cast("string"), F.lit("")))
         df = (
-            df.withColumn("lat", F.col("LAT").cast("double"))
-            .withColumn("lon", F.col("LON").cast("double"))
-            .withColumn("sog", F.col("SOG").cast("double"))
-            .withColumn(
-                "nav_status",
-                F.when(nav.isin("1", "at anchor", "anchor"), F.lit(1))
-                .when(nav.isin("5", "moored", "at berth"), F.lit(5))
-                .when(nav.isin("0", "under way using engine", "under way"), F.lit(0))
-                .otherwise(F.col("NavStatus").cast("int")),
-            )
+            df.withColumn("sog", F.col("SOG").cast("double"))
+            .withColumn("sog_clean", F.when(F.col("sog") >= 102.3, F.lit(None)).otherwise(F.col("sog")))
+            .withColumn("nav_status", F.when(nav.isin("1", "at anchor"), 1).when(nav.isin("5", "moored"), 5)
+                        .when(nav.isin("0", "under way using engine"), 0).otherwise(F.col("NavStatus").cast("int")))
             .withColumn("event_ts", F.to_timestamp("BaseDateTime"))
-            .withColumn("imo_clean", F.regexp_replace(F.coalesce(F.col("IMO"), F.lit("")), "[^0-9]", ""))
-            .withColumn("vessel_name_norm", F.upper(F.trim(F.col("VesselName"))))
         )
-        # drop null island & sog sentinel handling
-        df = df.where(~((F.col("lat") == 0) & (F.col("lon") == 0)))
-        df = df.withColumn("sog_clean", F.when(F.col("sog") >= 102.3, F.lit(None)).otherwise(F.col("sog")))
-        # join master vessel by IMO
-        masters = self.spark.read.format("delta").load(str(SILVER / "master_vessel"))
-        df = df.join(masters.select("master_vessel_id", "imo"), df.imo_clean == masters.imo, "left")
-        # port normalize destination
-        dest_norm_udf = F.udf(normalize_port, StringType())
-        df = df.withColumn("destination_port", dest_norm_udf(F.col("Destination")))
-        lineage = [c for c in ("_source_file", "_row_hash", "source_file", "row_hash") if c in df.columns]
+        df = self._attach_vessel(df, F.col("IMO"), F.col("VesselName"))
+        df = self._resolve_ports(df, F.col("Destination"), "destination_port")
         out = df.select(
-            "master_vessel_id",
-            F.col("MMSI").alias("mmsi"),
-            F.col("imo_clean").alias("imo"),
-            F.col("VesselName").alias("vessel_name"),
-            "event_ts",
-            "lat",
-            "lon",
-            "sog_clean",
-            "nav_status",
-            "destination_port",
-            F.col("CallSign").alias("call_sign"),
-            *lineage,
+            "master_vessel_id", F.col("MMSI").alias("mmsi"), "imo", F.col("VesselName").alias("vessel_name"),
+            "event_ts", "lat", "lon", "sog_clean", F.col("COG").cast("double").alias("cog"), "nav_status",
+            "destination_port", F.col("Destination").alias("destination_raw"), F.col("CallSign").alias("call_sign"),
+            F.col("Draft").cast("double").alias("draft_m"), "schema_version", "_row_hash",
         )
-        return self._write_silver(out, "ais_positions")
+        self._write(out, "ais_positions", {
+            "unlinked_vessel": F.col("master_vessel_id").isNull(),
+            "unresolved_destination": F.col("destination_port").isNull() & F.col("destination_raw").isNotNull(),
+            "unparsed_ts": F.col("event_ts").isNull(),
+        })
 
-    def silver_ais_live(self) -> dict[str, Any]:
-        df = self.spark.read.format("delta").load(str(BRONZE / "ais_live"))
-        df = (
-            df.withColumn("lat", F.col("LAT").cast("double"))
-            .withColumn("lon", F.col("LON").cast("double"))
-            .withColumn("nav_status", F.col("Status").cast("int"))
-            .withColumn("event_ts", F.to_timestamp("BaseDateTime"))
-            .withColumn("imo_clean", F.regexp_replace(F.coalesce(F.col("IMO"), F.lit("")), "[^0-9]", ""))
-        )
-        masters = self.spark.read.format("delta").load(str(SILVER / "master_vessel"))
-        df = df.join(masters.select("master_vessel_id", "imo"), df.imo_clean == masters.imo, "left")
+    def silver_ais_live(self) -> None:
+        df = self._bronze("ais_live", "ais_live")
+        df = self._attach_vessel(df, F.col("IMO"), F.col("VesselName"))
         out = df.select(
-            "master_vessel_id",
-            F.col("MMSI").alias("mmsi"),
-            F.col("imo_clean").alias("imo"),
-            F.col("VesselName").alias("vessel_name"),
-            "event_ts",
-            "lat",
-            "lon",
-            "nav_status",
-            F.col("SOG").cast("double").alias("sog"),
+            "master_vessel_id", F.col("MMSI").alias("mmsi"), "imo", F.col("VesselName").alias("vessel_name"),
+            F.to_timestamp("BaseDateTime").alias("event_ts"), F.col("LAT").cast("double").alias("lat"),
+            F.col("LON").cast("double").alias("lon"), F.col("SOG").cast("double").alias("sog"),
+            F.col("Status").cast("int").alias("nav_status"),
         )
-        return self._write_silver(out, "ais_live")
+        self._write(out, "ais_live", {"unlinked_vessel": F.col("master_vessel_id").isNull()})
 
-    def silver_port_agent_events(self) -> dict[str, Any]:
-        raw = self.spark.read.format("delta").load(str(BRONZE / "port_agent_calls"))
+    def silver_port_agent_events(self) -> None:
+        raw = self._bronze("port_agent_calls", "port_agent_events")
         cols = set(raw.columns)
 
-        def coal(*names: str, cast: str | None = None):
-            parts = []
-            for n in names:
-                if n in cols:
-                    c = F.col(n)
-                    if cast:
-                        c = c.cast(cast)
-                    parts.append(c)
-            if not parts:
-                return F.lit(None).cast("string")
-            return F.coalesce(*parts)
+        def coal(*names: str) -> Column:
+            parts = [F.col(n).cast("string") for n in names if n in cols]
+            return F.coalesce(*parts) if parts else F.lit(None).cast("string")
 
+        def local_ts(c: Column) -> Column:
+            return _ts(*(F.to_timestamp(c, f) for f in ("dd/MM/yyyy HH:mm", "yyyy-MM-dd HH:mm", "yyyy-MM-dd HH:mm:ss",
+                                                       "dd-MM-yyyy HH:mm", "yyyy-MM-dd'T'HH:mm:ss")))
+
+        def epoch(c: Column) -> Column:
+            return (F.when(c.rlike(r"^\d{13}$"), F.timestamp_seconds((c.cast("long") / 1000).cast("long")))
+                    .when(c.rlike(r"^\d{10}$"), F.timestamp_seconds(c.cast("long"))))
+
+        vjson = F.col("vessel") if "vessel" in cols else F.lit(None).cast("string")
         df = raw.select(
-            F.col("agency") if "agency" in cols else F.lit(None).alias("agency"),
-            coal("msgId", "message_id", "id", "ref").alias("message_id"),
-            coal("vslName", "ship", "vessel_name", "vsl_name").alias("vessel_name"),
-            coal("imo", "imo_no").alias("imo_raw"),
-            coal("port", "port_code", "port_locode", "location").alias("port_raw"),
-            coal("evt", "event_code", "status", "status_code", cast="string").alias("event_raw"),
-            coal("evtTimeLocal", "event_time", "datetime", "ts", cast="string").alias("event_time_raw"),
-            F.col("tz") if "tz" in cols else F.lit(None).alias("tz"),
-            coal("voy", "voyage", "voyage_ref").alias("voyage"),
+            coal("agency").alias("agency"), coal("msgId", "message_id", "id", "ref").alias("message_id"),
+            F.coalesce(coal("vslName", "ship", "vessel_name"), F.get_json_object(vjson, "$.name")).alias("vessel_name"),
+            F.coalesce(coal("imo", "imo_no"), F.get_json_object(vjson, "$.imo")).alias("imo_raw"),
+            coal("port", "port_code", "port_locode", "location").alias("port_raw"), coal("terminal").alias("terminal"),
+            coal("evt", "event_code", "status", "status_code").alias("event_raw"),
+            coal("event_time").alias("iso_time"), coal("ts").alias("epoch_time"),
+            coal("datetime", "evtTimeLocal").alias("local_time"), coal("tz").alias("tz"),
+            coal("eta").alias("eta_iso"), coal("eta_ts").alias("eta_epoch"), coal("eta_local").alias("eta_local"),
+            coal("voy", "voyage", "voyage_ref").alias("voyage"), "_row_hash",
         )
+        offset = F.coalesce(F.regexp_extract(F.col("tz"), r"([+-]\d{1,2})", 1).cast("int"), F.lit(0))
+        df = df.withColumn("__off", offset)
 
-        def map_event(code: str | None) -> str | None:
-            if code is None:
-                return None
-            c = str(code).strip().upper()
-            mapping = {
-                "10": "ETA",
-                "20": "ANC",
-                "30": "BRT",
-                "40": "COM",
-                "50": "CMP",
-                "60": "SLD",
-                "99": "OMIT",
-                "ETA": "ETA",
-                "ETA UPDATE": "ETA",
-                "ETA NOTICE": "ETA",
-                "ANC": "ANC",
-                "EOSP": "ANC",
-                "ANCHORED - AWAITING BERTH": "ANC",
-                "ANCHORED": "ANC",
-                "BRT": "BRT",
-                "ALL FAST": "BRT",
-                "COM": "COM",
-                "COMMENCED CARGO": "COM",
-                "CMP": "CMP",
-                "COMPLETED CARGO": "CMP",
-                "COMPLETED": "CMP",
-                "SLD": "SLD",
-                "SAILED": "SLD",
-                "OMIT": "OMIT",
-                "CALL CANCELLED": "OMIT",
-                "CALL OMITTED": "OMIT",
-            }
-            if c in mapping:
-                return mapping[c]
-            for k, v in mapping.items():
-                if k in c:
-                    return v
-            return c
-
-        event_udf = F.udf(map_event, StringType())
-        port_udf = F.udf(normalize_port, StringType())
-        imo_udf = F.udf(clean_imo, StringType())
+        def to_utc(local: Column) -> Column:
+            return F.timestamp_seconds(F.unix_timestamp(local) - F.col("__off") * 3600)
 
         df = (
-            df.withColumn("event_code", event_udf(F.col("event_raw")))
-            .withColumn("master_port", port_udf(F.col("port_raw")))
-            .withColumn("imo", imo_udf(F.col("imo_raw")))
+            df.withColumn("event_ts", _ts(F.to_timestamp("iso_time"), epoch(F.col("epoch_time")), to_utc(local_ts(F.col("local_time")))))
+            .withColumn("eta_reported_ts", _ts(F.to_timestamp("eta_iso"), epoch(F.col("eta_epoch")), to_utc(local_ts(F.col("eta_local")))))
         )
-        # Parse times: epoch seconds if numeric else try timestamp
-        df = df.withColumn(
-            "event_ts",
-            F.when(F.col("event_time_raw").rlike(r"^\d{10}$"), F.to_timestamp(F.from_unixtime(F.col("event_time_raw").cast("long"))))
-            .when(F.col("event_time_raw").rlike(r"^\d{13}$"), F.to_timestamp(F.from_unixtime((F.col("event_time_raw").cast("long") / 1000).cast("long"))))
-            .otherwise(F.to_timestamp(F.col("event_time_raw"))),
-        )
-        masters = self.spark.read.format("delta").load(str(SILVER / "master_vessel"))
-        df = df.join(masters.select(F.col("master_vessel_id"), F.col("imo").alias("m_imo")), df.imo == F.col("m_imo"), "left").drop("m_imo")
+        df = self._map_codes(df, F.col("event_raw"), "event_code", "port_event")
+        df = self._resolve_ports(df, F.col("port_raw"), "master_port")
+        df = self._attach_vessel(df, F.col("imo_raw"), F.col("vessel_name"))
         out = df.select(
-            "message_id",
-            "agency",
-            "master_vessel_id",
-            "vessel_name",
-            "imo",
-            "master_port",
-            "event_code",
-            "event_ts",
-            "voyage",
+            "message_id", "agency", "master_vessel_id", "vessel_name", "imo", "master_port", "port_raw", "terminal",
+            "event_code", "event_raw", "event_ts", "eta_reported_ts", "voyage", "_row_hash",
         )
-        return self._write_silver(out, "port_agent_events")
+        self._write(out, "port_agent_events", {
+            "unlinked_vessel": F.col("master_vessel_id").isNull(),
+            "unresolved_port": F.col("master_port").isNull() & F.col("port_raw").isNotNull(),
+            "unmapped_event": F.col("event_code").isNull() & F.col("event_raw").isNotNull(),
+            "unparsed_ts": F.col("event_ts").isNull(),
+        })
 
-    def silver_carrier_schedules(self) -> dict[str, Any]:
-        df = self.spark.read.format("delta").load(str(BRONZE / "carrier_schedules"))
-        port_udf = F.udf(normalize_port, StringType())
-        imo_udf = F.udf(clean_imo, StringType())
+    def silver_carrier_schedules(self) -> None:
+        df = self._bronze("carrier_schedules", "carrier_schedules")
+
+        def sched_ts(c: str) -> Column:
+            return (F.when(F.col(c).rlike(r"^\d{12}$"), F.to_timestamp(c, "yyyyMMddHHmm"))
+                    .when(F.col(c).rlike(r"^\d{10}$"), F.to_timestamp(c, "yyMMddHHmm")))
+
+        df = self._resolve_ports(df, F.col("port_locode"), "master_port")
+        df = self._attach_vessel(df, F.col("imo"), F.col("vessel_name"))
+        out = df.select(
+            F.col("scac").alias("carrier"), "service", "voyage", "vessel_name", "imo", "master_vessel_id", "master_port",
+            "terminal", sched_ts("eta_raw").alias("eta_ts"), sched_ts("etd_raw").alias("etd_ts"),
+            F.col("status").alias("schedule_status"), "_row_hash",
+        )
+        self._write(out, "carrier_schedules", {
+            "unlinked_vessel": F.col("master_vessel_id").isNull(),
+            "unresolved_port": F.col("master_port").isNull(),
+            "unparsed_ts": F.col("eta_ts").isNull(),
+        })
+
+    def silver_bills_of_lading(self) -> None:
+        df = self._bronze("bills_of_lading", "bills_of_lading")
+        w = Window.partitionBy("BLNumber", "ContainerNumber").orderBy(F.col("version").cast("int").desc_nulls_last())
+        before = df.count()
+        df = df.withColumn("__rn", F.row_number().over(w)).where("__rn = 1").drop("__rn")
+        self._prep["bills_of_lading"]["superseded_amendments_removed"] = before - df.count()
+        df = self._resolve_ports(df, F.col("PortOfLoading"), "pol")
+        df = self._resolve_ports(df, F.col("PortOfDischarge"), "pod")
+        names = [r[0] for r in df.select("ShipperName").union(df.select("ConsigneeName")).distinct().collect() if r[0]]
+        cmap = self._lit_map(self._customer_map(names))
+        null = F.lit(None).cast("string")
         df = (
-            df.withColumn("master_port", port_udf(F.col("port_locode")))
-            .withColumn("imo", imo_udf(F.col("imo")))
-            .withColumn("eta_ts", F.to_timestamp(F.col("eta_raw"), "yyyyMMddHHmm"))
+            df.withColumn("shipper_customer_id", cmap[F.col("ShipperName")] if cmap is not None else null)
+            .withColumn("consignee_customer_id", cmap[F.col("ConsigneeName")] if cmap is not None else null)
+            .withColumn("issue_date", _ts(*(F.to_date("IssueDate", f) for f in
+                                             ("yyyy-MM-dd", "yyyyMMdd", "dd/MM/yyyy", "MM/dd/yyyy", "dd-MMM-yyyy"))))
+            .withColumn("container_id", F.regexp_replace(F.upper(F.col("ContainerNumber")), "[^A-Z0-9]", ""))
+            .withColumn("booking_ref", F.col("BookingRef"))
+            .withColumn("teu", _teu(F.col("ContainerType")))
+            .withColumn("gross_weight_kg", F.col("GrossWeight").cast("double"))
         )
-        masters = self.spark.read.format("delta").load(str(SILVER / "master_vessel"))
-        df = df.join(masters.select("master_vessel_id", F.col("imo").alias("m_imo")), df.imo == F.col("m_imo"), "left").drop("m_imo")
-        return self._write_silver(df, "carrier_schedules")
+        df = self._attach_vessel(df, None, F.col("Vessel"))
+        df = df.drop("PortOfLoading", "PortOfDischarge", "IssueDate", "GrossWeight", "imo",
+                     "_source_file", "_ingested_at", "_source_system")
+        df = self._mask_pii(df, "bills_of_lading", "bills_of_lading")
+        self._write(df, "bills_of_lading", {
+            "unresolved_pol": F.col("pol").isNull(),
+            "unresolved_pod": F.col("pod").isNull(),
+            "unlinked_shipper": F.col("shipper_customer_id").isNull(),
+            "unparsed_issue_date": F.col("issue_date").isNull(),
+        })
 
-    def silver_bills_of_lading(self) -> dict[str, Any]:
-        df = self.spark.read.format("delta").load(str(BRONZE / "bills_of_lading"))
-        port_udf = F.udf(normalize_port, StringType())
-        imo_udf = F.udf(lambda v: None, StringType())  # vessel name based later
+    def silver_container_events(self) -> None:
+        df = self._bronze("container_events", "container_events")
+        df = self._map_codes(df, F.coalesce(F.col("equipmentEventTypeCode"), F.col("STAT"), F.col("evt")),
+                             "event_code", "container_event", feed="feed_format")
+        ind = F.upper(F.trim(F.coalesce(F.col("emptyIndicatorCode"), F.col("FE"), F.col("mt_fl"))))
+        df = df.withColumn("empty_indicator", F.when(ind.isin("EMPTY", "E", "MT"), "EMPTY")
+                           .when(ind.isin("LADEN", "L", "F", "FL", "FULL"), "LADEN"))
+        df = self._resolve_ports(df, F.coalesce(F.col("UNLocationCode"), F.col("LOC"), F.col("loc")), "master_port")
         df = (
-            df.withColumn("pol", port_udf(F.col("PortOfLoading")))
-            .withColumn("pod", port_udf(F.col("PortOfDischarge")))
-            .withColumn("shipper_contact_masked", self.hash_fn(F.col("ShipperContact")))
-            .withColumn("shipper_email_masked", self.hash_fn(F.col("ShipperEmail")))
-            .withColumn("shipper_phone_masked", self.hash_fn(F.col("ShipperPhone")))
-            .withColumn("shipper_tax_masked", self.hash_fn(F.col("ShipperTaxId")))
-            .withColumn("consignee_contact_masked", self.hash_fn(F.col("ConsigneeContact")))
-            .withColumn("consignee_email_masked", self.hash_fn(F.col("ConsigneeEmail")))
-            .withColumn("consignee_phone_masked", self.hash_fn(F.col("ConsigneePhone")))
-            .withColumn("consignee_tax_masked", self.hash_fn(F.col("ConsigneeTaxId")))
+            df.withColumn("event_ts", _ts(
+                F.to_timestamp("eventDateTime"), F.to_timestamp("EVTDT", "yyyyMMddHHmm"),
+                F.to_timestamp(F.concat_ws(" ", "evt_date", "evt_time"), "dd-MM-yy HHmm"),
+            ))
+            .withColumn("container_id", F.regexp_replace(F.upper(F.coalesce("equipmentReference", "CNTR", "container")), "[^A-Z0-9]", ""))
+            .withColumn("iso_type", F.coalesce("ISOEquipmentCode", "SZTP"))
         )
-        # Drop cleartext PII
-        drop_cols = [
-            "ShipperContact",
-            "ShipperEmail",
-            "ShipperPhone",
-            "ShipperTaxId",
-            "ConsigneeContact",
-            "ConsigneeEmail",
-            "ConsigneePhone",
-            "ConsigneeTaxId",
-        ]
-        keep = [c for c in df.columns if c not in drop_cols]
-        out = df.select(*keep)
-        GUARD.register_pii(
-            "silver.bills_of_lading",
-            [c for c in out.columns if "masked" in c.lower() or "tax" in c.lower()],
+        df = self._attach_vessel(df, F.col("vesselIMONumber"), F.col("VSL"))
+        out = df.select(
+            F.col("carrier_scac").alias("carrier"), "feed_format", "container_id", "event_code",
+            F.coalesce("equipmentEventTypeCode", "STAT", "evt").alias("event_raw"), "empty_indicator", "master_port",
+            F.coalesce("carrierBookingReference", "BKG", "bkg_ref").alias("booking_ref"), "event_ts",
+            "imo", "master_vessel_id", F.col("VSL").alias("vessel_name"),
+            F.coalesce("carrierVoyageNumber", "VOY", "voyage").alias("voyage"), "iso_type",
+            _teu(F.col("iso_type")).alias("teu"), "_row_hash",
         )
-        return self._write_silver(out, "bills_of_lading")
+        self._write(out, "container_events", {
+            "unmapped_event": F.col("event_code").isNull() & F.col("event_raw").isNotNull(),
+            "unresolved_port": F.col("master_port").isNull(),
+            "unparsed_ts": F.col("event_ts").isNull(),
+        })
 
-    def silver_container_events(self) -> dict[str, Any]:
-        df = self.spark.read.format("delta").load(str(BRONZE / "container_events"))
+    def silver_customers(self) -> None:
+        crm = self._bronze("customers", "customers")
+        cmap = self._silver("customer_record_map")
+        id_col = next((c for c in crm.columns if c.lower() == "cust_id"), crm.columns[0])
+        df = crm
+        if cmap is not None:
+            df = df.join(cmap.select("crm_record_id", "master_customer_id"), F.col(id_col).cast("string") == F.col("crm_record_id"), "left").drop("crm_record_id")
+        if "IsDeleted" in df.columns:
+            df = df.withColumn("is_deleted", F.lower(F.col("IsDeleted")).isin("true", "1", "y")).drop("IsDeleted")
+        if "Crt_Dt" in df.columns:
+            df = df.withColumn("created_date", F.to_date("Crt_Dt", "MM/dd/yyyy")).drop("Crt_Dt")
+        df = df.drop("_source_file", "_ingested_at", "_source_system")
+        df = self._mask_pii(df, "customers", "customers")
+        self._write(df, "customers", {"unlinked_customer": F.col("master_customer_id").isNull()})
 
-        def unify_event(feed: str | None, dcsa: str | None, edi: str | None, pipe: str | None) -> str | None:
-            f = (feed or "").lower()
-            if f == "dcsa":
-                m = {
-                    "GTOT": "GTOT",
-                    "GTIN": "GTIN",
-                    "LOAD": "LOAD",
-                    "DISC": "DISC",
-                    "STUF": "STUF",
-                    "STRP": "STRP",
-                    "ROLL": "ROLL",
-                    "HOLD": "HOLD",
-                    "RELS": "RELS",
-                    "CANC": "CANC",
-                    "ASGN": "ASGN",
-                    "ONHR": "ONHR",
-                    "OFHR": "OFHR",
-                    "RPRD": "RPRD",
-                }
-                return m.get((dcsa or "").upper(), (dcsa or "").upper() if dcsa else None)
-            if f == "edi_semicolon":
-                s = (edi or "").upper()
-                mapping = [
-                    ("EQUIPMENT REASSIGNED", "ASGN"),
-                    ("ROLLED", "ROLL"),
-                    ("CUSTOMS HOLD", "HOLD"),
-                    ("RELEASE", "RELS"),
-                    ("GATE OUT", "GTOT"),
-                    ("GATE IN", "GTIN"),
-                    ("LOADED", "LOAD"),
-                    ("DISCHARG", "DISC"),
-                    ("EMPTY TO SHIPPER", "GTOT"),
-                    ("CANCEL", "CANC"),
-                ]
-                for k, v in mapping:
-                    if k in s:
-                        return v
-                return s or None
-            # pipe
-            m = {
-                "O": "GTOT",
-                "I": "GTIN",
-                "L": "LOAD",
-                "D": "DISC",
-                "S": "STUF",
-                "U": "STRP",
-                "R": "ROLL",
-                "H": "HOLD",
-                "H2": "RELS",
-                "X": "CANC",
-                "A": "ASGN",
-                "N": "ONHR",
-                "F": "OFHR",
-                "P": "RPRD",
-            }
-            return m.get((pipe or "").upper(), pipe)
+    def silver_crew_manifests(self) -> None:
+        df = self._bronze("crew_manifests", "crew_manifests")
+        df = self._resolve_ports(df, F.col("port_meta"), "master_port")
+        df = self._attach_vessel(df, F.col("imo_meta"), F.col("vessel_name_meta"))
+        rank = [c for c in ("Rank", "Rank_or_rating") if c in df.columns]
+        if rank:
+            df = df.withColumn("rank", F.coalesce(*[F.col(c) for c in rank])).drop(*[c for c in rank if c != "rank"])
+        if "arrival_date_meta" in df.columns:
+            df = df.withColumn("arrival_date", _ts(*(F.to_date("arrival_date_meta", f) for f in ("dd.MM.yyyy", "dd/MM/yyyy", "yyyy-MM-dd"))))
+        df = df.withColumnRenamed("vessel_name_meta", "vessel_name").withColumnRenamed("port_meta", "port_raw")
+        df = df.drop("imo_meta", "arrival_date_meta", "_source_file", "_ingested_at", "_source_system")
+        df = self._mask_pii(df, "crew_manifests", "crew_manifests")
+        self._write(df, "crew_manifests", {
+            "unlinked_vessel": F.col("master_vessel_id").isNull(),
+            "unresolved_port": F.col("master_port").isNull() & F.col("port_raw").isNotNull(),
+        })
 
-        def unify_empty(feed: str | None, dcsa: str | None, edi: str | None, pipe: str | None) -> str | None:
-            vals = [dcsa, edi, pipe]
-            for v in vals:
-                if v is None:
+    # --- semantic layer for Silver ---------------------------------------------
+    def _write_silver_semantics(self) -> None:
+        sem = self.store.load_semantics()
+        bronze_cols = {
+            t: {str(c.get("name", "")).lower(): c for c in meta.get("columns") or []}
+            for t, meta in (sem.get("tables") or {}).items()
+        }
+        silver: dict[str, Any] = {}
+        for p in sorted(SILVER.iterdir()):
+            if not p.is_dir():
+                continue
+            cols = self.spark.read.format("delta").load(str(p)).columns
+            src = self.sources.get(p.name)
+            docs = {}
+            for c in cols:
+                if c.startswith("_"):
                     continue
-                u = str(v).upper()
-                if u in {"EMPTY", "E", "MT"}:
-                    return "EMPTY"
-                if u in {"LADEN", "F", "FL", "FULL"}:
-                    return "LADEN"
-            return None
+                if c in SILVER_COLUMN_DOCS:
+                    docs[c] = SILVER_COLUMN_DOCS[c]
+                elif c.endswith("_masked"):
+                    docs[c] = f"Salted hash of PII field {c[:-7]} (joinable, not readable)"
+                else:
+                    docs[c] = (bronze_cols.get(src or "", {}).get(c.lower()) or {}).get("meaning") or ""
+            entry: dict[str, Any] = {"source": src, "description": TABLE_DOCS.get(p.name, ""), "columns": docs}
+            if "event_code" in cols:
+                entry["code_map"] = {"event_code": PORT_EVENTS if p.name == "port_agent_events" else CONTAINER_EVENTS}
+            silver[p.name] = entry
+        sem["silver_tables"] = silver
+        sem["relationships"] = self._relationships(silver)
+        self.store.save_semantics(sem)
 
-        event_udf = F.udf(unify_event, StringType())
-        empty_udf = F.udf(unify_empty, StringType())
-        port_udf = F.udf(normalize_port, StringType())
-
-        df = df.withColumn(
-            "event_code",
-            event_udf(
-                F.col("feed_format"),
-                F.col("equipmentEventTypeCode"),
-                F.col("STAT"),
-                F.col("evt"),
-            ),
-        ).withColumn(
-            "empty_indicator",
-            empty_udf(
-                F.col("feed_format"),
-                F.col("emptyIndicatorCode"),
-                F.col("FE"),
-                F.col("mt_fl"),
-            ),
-        ).withColumn(
-            "container_id",
-            F.regexp_replace(
-                F.upper(F.coalesce(F.col("equipmentReference"), F.col("CNTR"), F.col("container"))),
-                "[^A-Z0-9]",
-                "",
-            ),
-        ).withColumn(
-            "master_port",
-            port_udf(F.coalesce(F.col("UNLocationCode"), F.col("LOC"), F.col("loc"))),
-        ).withColumn(
-            "booking_ref",
-            F.coalesce(F.col("carrierBookingReference"), F.col("BKG"), F.col("bkg_ref")),
-        ).withColumn(
-            "carrier",
-            F.col("carrier_scac"),
-        )
-        # event time approx
-        df = df.withColumn(
-            "event_ts",
-            F.coalesce(
-                F.to_timestamp(F.col("eventDateTime")),
-                F.to_timestamp(F.col("EVTDT"), "yyyyMMddHHmm"),
-                F.to_timestamp(F.concat_ws(" ", F.col("evt_date"), F.col("evt_time")), "dd-MM-yy HHmm"),
-            ),
-        )
-        out = df.select(
-            "carrier",
-            "feed_format",
-            "container_id",
-            "event_code",
-            "empty_indicator",
-            "master_port",
-            "booking_ref",
-            "event_ts",
-            F.col("vesselIMONumber").alias("vessel_imo"),
-            F.col("VSL").alias("vessel_name"),
-            F.col("vsl_callsign").alias("call_sign"),
-        )
-        return self._write_silver(out, "container_events")
-
-    def silver_customers(self) -> dict[str, Any]:
-        crm = self.spark.read.format("delta").load(str(BRONZE / "customers"))
-        cmap = self.spark.read.format("delta").load(str(SILVER / "customer_record_map"))
-        id_col = next(
-            (
-                c
-                for c in crm.columns
-                if c.lower() in {"cust_id", "custid"}
-                or ("cust" in c.lower() and "id" in c.lower())
-            ),
-            crm.columns[0],
-        )
-        cmap2 = cmap.select(
-            F.col("crm_record_id"),
-            F.col("master_customer_id"),
-            F.col("account_name").alias("resolved_account_name"),
-        )
-        df = crm.join(cmap2, crm[id_col].cast("string") == cmap2.crm_record_id, "left")
-        for c in list(df.columns):
-            cl = c.lower()
-            if c.endswith("_masked") or c in {"master_customer_id", "crm_record_id", "resolved_account_name"}:
-                continue
-            if any(x in cl for x in ["email", "phone", "contact", "street", "tax", "owner"]):
-                df = df.withColumn(c + "_masked", self.hash_fn(F.col(c))).drop(c)
-        # Deduplicate any accidental duplicate column names
-        seen = set()
-        keep = []
-        for c in df.columns:
-            if c.lower() in seen:
-                continue
-            seen.add(c.lower())
-            keep.append(c)
-        df = df.select(*keep)
-        return self._write_silver(df, "customers")
-
-    def silver_crew_manifests(self) -> dict[str, Any]:
-        df = self.spark.read.format("delta").load(str(BRONZE / "crew_manifests"))
-        for c in df.columns:
-            cl = c.lower()
-            if any(x in cl for x in ["passport", "dob", "birth", "surname", "family", "given", "first name", "seaman", "cdc"]):
-                df = df.withColumn(c + "_masked", self.hash_fn(F.col(c).cast("string"))).drop(c)
-        port_udf = F.udf(normalize_port, StringType())
-        if "port_meta" in df.columns:
-            df = df.withColumn("master_port", port_udf(F.col("port_meta")))
-        imo_udf = F.udf(clean_imo, StringType())
-        if "imo_meta" in df.columns:
-            df = df.withColumn("imo", imo_udf(F.col("imo_meta")))
-            masters = self.spark.read.format("delta").load(str(SILVER / "master_vessel"))
-            df = df.join(masters.select("master_vessel_id", F.col("imo").alias("m_imo")), df.imo == F.col("m_imo"), "left").drop("m_imo")
-        GUARD.register_pii("silver.crew_manifests", [c for c in df.columns if "masked" in c.lower()])
-        return self._write_silver(df, "crew_manifests")
+    @staticmethod
+    def _relationships(silver: dict[str, Any]) -> list[dict[str, str]]:
+        rels = []
+        for t, meta in silver.items():
+            for c in meta["columns"]:
+                target = ENTITY_KEYS.get(c)
+                if target and target[0] in silver and target[0] != t:
+                    rels.append({"from": f"{t}.{c}", "to": f"{target[0]}.{target[1]}", "type": "many_to_one"})
+        def has(t: str, c: str) -> bool:
+            return t in silver and c in silver[t]["columns"]
+        for (a, ac), (b, bc), label in [
+            (("container_events", "booking_ref"), ("bills_of_lading", "booking_ref"), "booking"),
+            (("container_events", "container_id"), ("bills_of_lading", "container_id"), "container"),
+            (("port_agent_events", "master_vessel_id"), ("carrier_schedules", "master_vessel_id"), "vessel call (+ master_port)"),
+            (("crew_manifests", "master_vessel_id"), ("port_agent_events", "master_vessel_id"), "vessel arrival"),
+        ]:
+            if has(a, ac) and has(b, bc):
+                rels.append({"from": f"{a}.{ac}", "to": f"{b}.{bc}", "type": "many_to_many", "via": label})
+        return rels
