@@ -7,7 +7,6 @@ from maritimeiq.agents.insight import InsightAgent, REFUSE_MSG
 from maritimeiq.utils.logging_feed import FEED
 
 SOURCE_LABELS = {
-    "verified_query": "Verified Gold Query",
     "template": "Template",
     "llm": "LLM",
     "refused": "Refused",
@@ -24,14 +23,12 @@ def render_ask(orch) -> None:
     )
 
     presets = [
-        "In which month was the average anchorage wait at Los Angeles/Long Beach highest, and how long was it in days?",
-        "Which 5 ports had the longest average anchorage wait (days) in 2022?",
-        "Schedule reliability: share of container-ship calls arriving within 24h of the published ETA, by carrier and year.",
-        "Who are the top 5 shippers by TEU shipped?",
-        "What was the average import container dwell (discharge to gate-out) at LA/Long Beach by quarter?",
-        "Which vessels called Busan most often in 2022?",
-        "What are the key findings from the investigation?",
-        "What are the passport numbers of the crew on MSC AURORA?",
+        "Which vessels waited longest at anchor off Long Beach?",
+        "In which month was average anchorage wait at Los Angeles / Long Beach highest?",
+        "How many equipment reassignments did each carrier record?",
+        "How many containers were put on customs hold by port?",
+        "What share of bookings was rolled to a later sailing?",
+        "Who are the top shippers by container count on bills of lading?",
         "What is the weather forecast for Mars next Tuesday?",
     ]
     preset = st.selectbox("Preset Questions", presets)
@@ -41,7 +38,7 @@ def render_ask(orch) -> None:
     if st.button("Ask", type="primary", use_container_width=True):
         insight = InsightAgent(orch.spark, orch.gateway)
         with st.spinner("Insight Agent (Gold → Silver → refuse)…"):
-            result = insight.ask(q)
+            result = insight.ask(q, approve_gold=False)
         st.session_state["ask_result"] = result
         FEED.emit(
             "insight",
@@ -64,9 +61,6 @@ def render_ask(orch) -> None:
     if r.get("refused") or (not r.get("ok") and not r.get("sql")):
         st.warning(r.get("message") or r.get("error") or REFUSE_MSG)
         st.caption("Answer layer: Refused — outside activated Gold/Silver data.")
-        if r.get("reason"):
-            with st.expander("Why it was refused"):
-                st.write(r["reason"])
         return
 
     source_key = r.get("answer_source") or "unknown"
@@ -79,12 +73,7 @@ def render_ask(orch) -> None:
         f'<span class="mq-badge">Confidence: {r.get("confidence")}</span>',
         unsafe_allow_html=True,
     )
-    if r.get("summary"):
-        st.markdown(f"### {r['summary']}")
     st.write(r.get("explanation") or "")
-    judge = r.get("judge")
-    if judge:
-        st.caption(f"LLM-as-Judge: **{judge.get('verdict')}** ({judge.get('score')}) — {judge.get('rationale') or ''}")
     terms = r.get("glossary_terms") or []
     if terms:
         st.markdown(

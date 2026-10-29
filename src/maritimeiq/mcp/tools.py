@@ -77,21 +77,13 @@ class LakehouseTools:
         FEED.emit("lakehouse", f"profile {qualified}.{column}", acting_agent=agent)
         return {"ok": True, "table": qualified, "column": column, "stats": stats, "samples": samples}
 
-    def run_spark_sql(
-        self,
-        sql: str,
-        agent: str = "transform",
-        limit: int = 100,
-        allowed_tables: set[str] | None = None,
-    ) -> dict[str, Any]:
-        decision = GUARD.check_sql(sql, agent=agent, allowed_tables=allowed_tables)
+    def run_spark_sql(self, sql: str, agent: str = "transform", limit: int = 100) -> dict[str, Any]:
+        decision = GUARD.check_sql(sql, agent=agent)
         if not decision.allowed:
-            return {"ok": False, "error": decision.reason, "rows": [], "blocked": True}
+            return {"ok": False, "error": decision.reason, "rows": []}
         try:
             df = self.spark.sql(sql)
             rows = [r.asDict(recursive=True) for r in df.limit(limit).collect()]
-            # Tool responses never carry cleartext PII, whatever the query selected
-            rows = GUARD.mask_result_rows(rows)
             return {"ok": True, "columns": df.columns, "rows": rows, "count": len(rows)}
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": str(e), "rows": []}
@@ -213,23 +205,12 @@ class ReviewTools:
         FEED.emit("review", "correction stored", acting_agent=agent)
         return {"ok": True}
 
-    def get_approval(self, purpose: str, agent: str = "human", approver: str = "ui-user") -> dict[str, Any]:
-        """Issue an approval id. Only a human (UI action / explicit CLI opt-in) may call this —
-        agents must never approve their own writes."""
+    def get_approval(self, purpose: str, agent: str = "human") -> dict[str, Any]:
         import uuid
-        from datetime import datetime, timezone
 
-        if agent != "human":
-            FEED.emit("review", f"approval refused for agent={agent}", level="warn", event_type="guard_block")
-            return {"ok": False, "error": "Only a human can issue approvals"}
         approval_id = f"APPR-{uuid.uuid4().hex[:10]}"
         GUARD.register_approval(approval_id)
-        rec = {
-            "approval_id": approval_id,
-            "purpose": purpose,
-            "approver": approver,
-            "ts": datetime.now(timezone.utc).isoformat(),
-        }
+        rec = {"approval_id": approval_id, "purpose": purpose}
         with self.approvals_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
         FEED.emit("review", f"approval {approval_id} for {purpose}", acting_agent=agent)

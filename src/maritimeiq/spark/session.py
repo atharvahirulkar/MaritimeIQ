@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from functools import lru_cache
 from typing import Any
 
@@ -10,7 +9,7 @@ import yaml
 from delta import configure_spark_with_delta_pip
 from pyspark.sql import SparkSession
 
-from maritimeiq.utils.paths import LAKEHOUSE, SPARK_CFG, SRC, ensure_lakehouse_dirs
+from maritimeiq.utils.paths import LAKEHOUSE, SPARK_CFG, ensure_lakehouse_dirs
 
 
 def _load_cfg() -> dict[str, Any]:
@@ -24,15 +23,9 @@ def get_spark(app_name: str | None = None) -> SparkSession:
     ensure_lakehouse_dirs()
     cfg = _load_cfg()
     warehouse = str(LAKEHOUSE.resolve())
-    # Workers must run the driver's interpreter (minor versions must match) and be able to
-    # import maritimeiq for UDFs even without `pip install -e .`
-    py = os.environ.get("MARITIMEIQ_PYTHON") or sys.executable
+    py = os.environ.get("MARITIMEIQ_PYTHON") or os.environ.get("PYSPARK_PYTHON") or "python3"
     os.environ["PYSPARK_PYTHON"] = py
     os.environ["PYSPARK_DRIVER_PYTHON"] = py
-    src = str(SRC)
-    parts = [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]
-    if src not in parts:
-        os.environ["PYTHONPATH"] = os.pathsep.join([src, *parts])
 
     builder = (
         SparkSession.builder.appName(app_name or cfg.get("app_name", "MaritimeIQ"))

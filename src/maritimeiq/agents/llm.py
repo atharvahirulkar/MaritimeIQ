@@ -107,8 +107,6 @@ class LLMClient:
         load_env()
         self.provider = (os.environ.get("MARITIMEIQ_LLM_PROVIDER") or "openai").lower()
         self.model = os.environ.get("MARITIMEIQ_MODEL", "gpt-4o-mini")
-        # Judge may run on a different (ideally stronger / different-family) model than the generator
-        self.judge_model = os.environ.get("MARITIMEIQ_JUDGE_MODEL") or None
         self.api_key = os.environ.get("OPENAI_API_KEY")
         self._client = None
         self._vertex = None
@@ -127,7 +125,7 @@ class LLMClient:
                 try:
                     from openai import OpenAI
 
-                    self._client = OpenAI(api_key=key, base_url=base, timeout=60)
+                    self._client = OpenAI(api_key=key, base_url=base)
                     self.model = os.environ.get("MARITIMEIQ_MODEL", "google/gemini-2.0-flash")
                     return
                 except Exception:  # noqa: BLE001
@@ -138,7 +136,7 @@ class LLMClient:
             try:
                 from openai import OpenAI
 
-                self._client = OpenAI(api_key=self.api_key, timeout=60)
+                self._client = OpenAI(api_key=self.api_key)
             except Exception:  # noqa: BLE001
                 self._client = None
 
@@ -146,14 +144,13 @@ class LLMClient:
     def available(self) -> bool:
         return self._client is not None
 
-    def complete_json(self, system: str, user: str, judge: bool = False) -> dict[str, Any] | None:
+    def complete_json(self, system: str, user: str) -> dict[str, Any] | None:
         if not self._client:
             return None
-        model = (self.judge_model or self.model) if judge else self.model
         for _attempt in range(2):
             try:
                 resp = self._client.chat.completions.create(
-                    model=model,
+                    model=self.model,
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
@@ -167,30 +164,8 @@ class LLMClient:
                 continue
         return None
 
-    def _heuristic_proposal(
-        self,
-        columns: list[str],
-        profiles: dict[str, dict[str, Any]],
-        corrections: list[dict[str, Any]] | None = None,
-    ) -> SemanticProposal:
+    def _heuristic_proposal(self, columns: list[str], profiles: dict[str, dict[str, Any]]) -> SemanticProposal:
         cols = [_heuristic_column(c, profiles.get(c, {}).get("samples", [])) for c in columns]
-        # Learn from HITL: a human-approved/edited meaning for the same column name in any
-        # earlier table is reused (this is what makes the 2nd source need fewer reviews).
-        learned: dict[str, dict[str, Any]] = {}
-        for corr in corrections or []:
-            if corr.get("action") in {"edit", "approve"} and corr.get("meaning") and corr.get("approver", "human") == "human":
-                learned[str(corr.get("column", "")).lower()] = corr
-        for i, c in enumerate(cols):
-            corr = learned.get(c.name.lower())
-            if corr:
-                cols[i] = c.model_copy(
-                    update={
-                        "meaning": corr["meaning"],
-                        "pii": bool(corr.get("pii", c.pii)),
-                        "confidence": max(c.confidence, 0.9),
-                        "rationale": f"Reused human correction from {corr.get('table')}.{corr.get('column')}",
-                    }
-                )
         joins = []
         for c in columns:
             cl = c.lower()
@@ -235,7 +210,7 @@ class LLMClient:
                         except Exception:  # noqa: BLE001
                             pass
         self.last_source = "heuristic"
-        return self._heuristic_proposal(columns, profiles, corrections)
+        return self._heuristic_proposal(columns, profiles)
 
 
 LLM = LLMClient()

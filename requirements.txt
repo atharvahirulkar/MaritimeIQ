@@ -15,4 +15,3 @@ mcp==1.6.0
 langgraph==0.3.5
 langchain-core==0.3.45
 openai==1.66.3
-sqlglot==30.25.0

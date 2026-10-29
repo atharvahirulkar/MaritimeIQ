@@ -74,75 +74,19 @@ class IngestionAgent:
     def run(self, state: dict[str, Any]) -> dict[str, Any]:
         FEED.emit("ingestion", "Starting Bronze ingestion")
         results: dict[str, Any] = {}
-        loaders = {
-            "ais_positions": self.ingest_ais_positions,
-            "ais_live": lambda: self.ingest_ais_live(batch=True),
-            "port_agent_calls": self.ingest_port_agent_calls,
-            "carrier_schedules": self.ingest_carrier_schedules,
-            "bills_of_lading": self.ingest_bills_of_lading,
-            "container_events": self.ingest_container_events,
-            "crew_manifests": self.ingest_crew_manifests,
-            "customers": self.ingest_customers,
-            "reference": self.ingest_reference,
-        }
-        for name, load in loaders.items():
-            if not (SOURCES / name).exists():
-                results[name] = {"ok": False, "rows": 0, "error": "source folder missing"}
-                continue
-            try:
-                results[name] = load()
-            except Exception as exc:  # noqa: BLE001
-                results[name] = {"ok": False, "rows": 0, "error": str(exc)[:300]}
-                FEED.emit("ingestion", f"{name} failed: {exc}", level="error")
-        # Any other source folder lands through the generic, format-sniffing loader
-        known = set(results) | {"reference"}
-        for folder in sorted(p for p in SOURCES.iterdir() if p.is_dir() and not p.name.startswith(".")) if SOURCES.exists() else []:
-            if folder.name not in known:
-                results[folder.name] = self.ingest_generic(folder)
+        results["ais_positions"] = self.ingest_ais_positions()
+        results["ais_live"] = self.ingest_ais_live(batch=True)
+        results["port_agent_calls"] = self.ingest_port_agent_calls()
+        results["carrier_schedules"] = self.ingest_carrier_schedules()
+        results["bills_of_lading"] = self.ingest_bills_of_lading()
+        results["container_events"] = self.ingest_container_events()
+        results["crew_manifests"] = self.ingest_crew_manifests()
+        results["customers"] = self.ingest_customers()
+        results["reference"] = self.ingest_reference()
         state["bronze_tables"] = results
         state["phase"] = "bronze_done"
         FEED.emit("ingestion", "Bronze ingestion complete", results={k: v.get("rows") for k, v in results.items()})
         return state
-
-    def ingest_generic(self, folder: Path) -> dict[str, Any]:
-        """Unknown source: read csv/tsv/json(l)/parquet/xlsx files, union by name, add lineage."""
-        frames: list[DataFrame] = []
-        for f in sorted(p for p in folder.rglob("*") if p.is_file() and not p.name.startswith(".")):
-            ext = f.suffix.lower()
-            try:
-                if ext in {".csv", ".tsv", ".txt"}:
-                    sep = "\t" if ext == ".tsv" else ","
-                    df = self.spark.read.option("header", True).option("sep", sep).option("inferSchema", False).csv(str(f))
-                elif ext in {".json", ".jsonl", ".ndjson"}:
-                    df = self.spark.read.option("multiLine", ext == ".json").json(str(f))
-                elif ext == ".parquet":
-                    df = self.spark.read.parquet(str(f))
-                elif ext in {".xlsx", ".xlsm"}:
-                    wb = load_workbook(f, read_only=True, data_only=True)
-                    rows: list[dict[str, Any]] = []
-                    for ws in wb.worksheets:
-                        it = ws.iter_rows(values_only=True)
-                        header = [str(h) if h is not None else f"col_{i}" for i, h in enumerate(next(it, []) or [])]
-                        for r in it:
-                            rows.append({h: (None if v is None else str(v)) for h, v in zip(header, r)})
-                    if not rows:
-                        continue
-                    cols = sorted({k for r in rows for k in r})
-                    df = self.spark.createDataFrame([{c: r.get(c) for c in cols} for r in rows])
-                else:
-                    continue
-            except Exception as exc:  # noqa: BLE001
-                FEED.emit("ingestion", f"skipped {f.name}: {exc}", level="warn")
-                continue
-            df = df.select([F.col(c).cast("string") for c in df.columns])
-            frames.append(_add_lineage(_sanitize_columns(df), str(f), folder.name))
-        if not frames:
-            return {"ok": False, "rows": 0, "error": f"no readable files in {folder.name}"}
-        out = frames[0]
-        for fr in frames[1:]:
-            out = out.unionByName(fr, allowMissingColumns=True)
-        FEED.emit("ingestion", f"{folder.name} loaded via generic loader", event_type="new_source")
-        return self._write(out, folder.name)
 
     def _write(self, df: DataFrame, table: str) -> dict[str, Any]:
         df = _sanitize_columns(df)
@@ -282,14 +226,8 @@ class IngestionAgent:
         path = SOURCES / "carrier_schedules"
         raw = self.spark.read.text(str(path / "*.txt"))
         raw = raw.withColumn("_src", F.input_file_name())
-        # HDR carries the file's time basis (TZ=UTC | TZ=LOCAL); keep it on every D record
-        hdr = raw.where(F.col("value").startswith("HDR")).select(
-            F.col("_src").alias("_hdr_src"),
-            F.regexp_extract(F.col("value"), r"TZ=([A-Z]+)", 1).alias("schedule_tz"),
-        )
         # Keep D records only for the main bronze table
         d = raw.where(F.col("value").startswith("D"))
-        d = d.join(hdr, d["_src"] == hdr["_hdr_src"], "left").drop("_hdr_src")
         parsed = (
             d.withColumn("rec_type", F.substring("value", 1, 1))
             .withColumn("service", F.trim(F.substring("value", 2, 6)))

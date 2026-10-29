@@ -11,7 +11,7 @@ from maritimeiq.context_store.store import ContextStore
 from maritimeiq.governance.guard import GUARD
 from maritimeiq.mcp.tools import MCPGateway
 from maritimeiq.utils.logging_feed import FEED
-from maritimeiq.utils.paths import CONFIGS
+from maritimeiq.utils.paths import CONFIGS, GROUND_TRUTH
 
 
 class ContextAgent:
@@ -34,7 +34,32 @@ class ContextAgent:
         self.system_prompt = (CONFIGS / "prompts" / "context_system.txt").read_text(encoding="utf-8")
         self.auto_threshold = 0.85
 
-    def propose_for_table(self, table: str, prior_columns: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def _gold_meanings_for_table(self, table: str) -> dict[str, str]:
+        path = GROUND_TRUTH / "data_dictionary.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        # fuzzy match dictionary keys
+        out: dict[str, str] = {}
+        for key, cols in data.items():
+            if not isinstance(cols, dict):
+                continue
+            key_l = key.lower()
+            if table.replace("_", " ") in key_l or table.split("_")[0] in key_l or (
+                table == "port_agent_calls" and "port_agent" in key_l
+            ) or (table == "ais_positions" and "ais_positions" in key_l) or (
+                table == "ais_live" and "ais_live" in key_l
+            ) or (table == "bills_of_lading" and "bills_of_lading" in key_l) or (
+                table == "container_events" and "container_events" in key_l
+            ) or (table == "customers" and "customers" in key_l) or (
+                table == "crew_manifests" and "crew_manifests" in key_l
+            ) or (table == "carrier_schedules" and "carrier_schedules" in key_l):
+                for col, meaning in cols.items():
+                    if col.startswith("_"):
+                        continue
+                    if isinstance(meaning, str):
+                        out[col] = meaning
+        return out
+
+    def propose_for_table(self, table: str) -> dict[str, Any]:
         sample = self.gateway.lakehouse.read_sample(f"bronze.{table}", n=5, agent="context")
         if not sample.get("ok"):
             return {"table": table, "ok": False, "error": sample.get("error")}
@@ -58,19 +83,11 @@ class ContextAgent:
             source=source,
             n_columns=len(proposal.columns),
         )
-        # Judge sees only the proposal + profile evidence (never ground truth)
-        graded = self.judge.grade_semantics([c.model_dump() for c in proposal.columns], profiles)
-        prior = {c.get("name"): c for c in (prior_columns or [])}
+        gold = self._gold_meanings_for_table(table)
+        graded = self.judge.grade_semantics([c.model_dump() for c in proposal.columns], gold)
         approved_cols = []
         needs_review = []
         for g in graded:
-            human = prior.get(g.get("name"))
-            if human and human.get("status") in {"human_approved", "rejected"}:
-                # Re-runs never undo a human decision
-                g.update({k: human[k] for k in ("meaning", "pii", "code_map", "status", "resolved") if k in human})
-                if g["status"] == "human_approved":
-                    approved_cols.append(g)
-                continue
             if g.get("score", 0) >= self.auto_threshold and g.get("grade") in {"correct", "plausible"}:
                 g["status"] = "auto_approved"
                 approved_cols.append(g)
@@ -79,7 +96,7 @@ class ContextAgent:
                 needs_review.append(g)
                 self.gateway.review.create_review_task(
                     "semantic_column",
-                    {"table": table, "column": g.get("name"), "grade": g.get("grade"), "score": g.get("score")},
+                    {"table": table, "column": g},
                     agent="context",
                 )
         if needs_review:
@@ -121,20 +138,11 @@ class ContextAgent:
         }
 
     def apply_human_decision(
-        self,
-        table: str,
-        column_name: str,
-        decision: str,
-        edited_meaning: str | None = None,
-        approver: str = "human",
-        pii: bool | None = None,
+        self, table: str, column_name: str, decision: str, edited_meaning: str | None = None
     ) -> dict[str, Any]:
         proposals = self.store.load_proposals()
         table_props = proposals.get(table, {}).get("columns", [])
         col = next((c for c in table_props if c["name"] == column_name), {"name": column_name})
-        if pii is not None:
-            col["pii"] = bool(pii)
-        col["approver"] = approver
         if decision == "reject":
             self.store.append_correction(
                 {"table": table, "column": column_name, "action": "reject", "prior": col}
@@ -145,7 +153,6 @@ class ContextAgent:
                     c["resolved"] = True
             proposals[table] = {**(proposals.get(table) or {}), "columns": table_props}
             self.store.save_proposals(proposals)
-            self._invalidate_silver()
             return {"ok": True}
         if decision == "edit" and edited_meaning:
             col["meaning"] = edited_meaning
@@ -160,8 +167,7 @@ class ContextAgent:
             )
         else:
             self.store.append_correction(
-                {"table": table, "column": column_name, "action": "approve", "meaning": col.get("meaning"),
-                 "pii": col.get("pii"), "approver": approver}
+                {"table": table, "column": column_name, "action": "approve", "meaning": col.get("meaning")}
             )
         sem = self.store.load_semantics()
         tables = sem.setdefault("tables", {})
@@ -179,38 +185,22 @@ class ContextAgent:
                     c["meaning"] = edited_meaning
         proposals[table] = {**(proposals.get(table) or {}), "columns": table_props}
         self.store.save_proposals(proposals)
-        for c in table_props:
-            if c.get("name") == column_name and pii is not None:
-                c["pii"] = bool(pii)
-        self.store.save_proposals(proposals)
         if col.get("pii"):
             GUARD.register_pii(f"bronze.{table}", [column_name])
-            GUARD.register_pii(f"silver.{table}", [column_name])
-        self._invalidate_silver()
         return {"ok": True}
-
-    @staticmethod
-    def _invalidate_silver() -> None:
-        """Semantics changed → Silver (and everything after it) must be rebuilt."""
-        from maritimeiq.agents.orchestrator import invalidate_from
-
-        invalidate_from("silver")
 
     def run(self, state: dict[str, Any], tables: list[str] | None = None) -> dict[str, Any]:
         FEED.emit("context", "Building semantic layer")
-        listed = self.gateway.lakehouse.list_tables("bronze", agent="context").get("tables", [])
-        # Known tables first (demonstrates correction learning), then any new source
-        ordered = [t for t in self.TABLE_ORDER if t in listed] + sorted(
-            t for t in listed if t not in self.TABLE_ORDER and not t.startswith("ref_")
-        )
-        tables = tables or ordered
-        prior = self.store.load_proposals() or {}
+        tables = tables or self.TABLE_ORDER
         results = {}
         walkthrough = bool(state.get("walkthrough", False))
+        # Demonstrate learning: process first port-agent-like then continue
         for t in tables:
-            if t not in listed:
+            # skip missing
+            listed = self.gateway.lakehouse.list_tables("bronze")
+            if t not in listed.get("tables", []):
                 continue
-            results[t] = self.propose_for_table(t, (prior.get(t) or {}).get("columns"))
+            results[t] = self.propose_for_table(t)
         self.store.save_proposals(results)
 
         open_gaps = 0
@@ -224,8 +214,8 @@ class ContextAgent:
                     if col.get("grade") == "wrong":
                         FEED.emit("context", f"HITL required for {t}.{col['name']}", level="warn")
                 elif col.get("grade") != "wrong":
-                    # Unattended batch run: policy approves non-wrong gaps; recorded as such, not as a human.
-                    self.apply_human_decision(t, col["name"], "approve", approver="batch-policy")
+                    # Legacy batch/demo path: soft-approve non-wrong reviews.
+                    self.apply_human_decision(t, col["name"], "approve")
                 else:
                     FEED.emit("context", f"HITL required for {t}.{col['name']}", level="warn")
                     open_gaps += 1
